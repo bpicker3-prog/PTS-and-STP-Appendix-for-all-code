@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=seq_worker
+#SBATCH --partition=htc
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+#SBATCH --time=04:00:00
+#SBATCH --output=/scratch/%u/slurm_logs/%x_%A_%a.out
+#SBATCH --error=/scratch/%u/slurm_logs/%x_%A_%a.err
+
+set -euo pipefail
+shopt -s nullglob
+
+SCRATCH_BASE="/scratch/$USER"
+mkdir -p "$SCRATCH_BASE/slurm_logs"
+
+NUM_SEQS="${NUM_SEQS:-200}"
+FINAL_BASE="${FINAL_BASE:-$HOME/protein_start}"
+MPNN_MODEL="${MPNN_MODEL:-protein_mpnn}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--model)
+      case "${2:-}" in
+        ligand)  MPNN_MODEL="ligand_mpnn" ;;
+        protein) MPNN_MODEL="protein_mpnn" ;;
+        soluble) MPNN_MODEL="soluble_mpnn" ;;
+        *)       MPNN_MODEL="${2:-}" ;;
+      esac
+      shift 2
+      ;;
+    *) echo "Unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+case "$MPNN_MODEL" in
+  protein_mpnn) MODEL_TAG="protein" ;;
+  ligand_mpnn)  MODEL_TAG="ligand" ;;
+  soluble_mpnn) MODEL_TAG="soluble" ;;
+  *)            MODEL_TAG="$MPNN_MODEL" ;;
+esac
+
+[[ -n "${LIST_FILE:-}" ]] || { echo "ERROR: LIST_FILE not set" >&2; exit 2; }
+[[ -f "${LIST_FILE}" ]] || { echo "ERROR: LIST_FILE not found: ${LIST_FILE}" >&2; exit 2; }
+
+TASK="${SLURM_ARRAY_TASK_ID}"
+protein_index=$(( (TASK - 1) / NUM_SEQS + 1 ))
+seq_index=$(( (TASK - 1) % NUM_SEQS + 1 ))
+
+PDB_PATH="$(
+  grep -vE '^[[:space:]]*($|#)' "${LIST_FILE}" | sed -n "${protein_index}p"
+)"
+PDB_PATH="$(echo "${PDB_PATH}" | tr -d '\r' | xargs || true)"
+[[ -n "$PDB_PATH" ]] || { echo "ERROR: no protein for index ${protein_index}" >&2; exit 2; }
+
+if [[ "$PDB_PATH" =~ ^[0-9A-Za-z]{4}$ ]]; then
+  PDB_STEM="$(echo "$PDB_PATH" | tr '[:upper:]' '[:lower:]')_assembly1"
+else
+  PDB_BASE="$(basename "$PDB_PATH")"
+  PDB_STEM="${PDB_BASE%.*}"
+fi
+
+SEQ_FILE="${FINAL_BASE}/${MODEL_TAG}/${PDB_STEM}/seqs/seq_$(printf '%04d' "$seq_index").fasta"
+REF_PDB="${FINAL_BASE}/${MODEL_TAG}/${PDB_STEM}/ref_clean.pdb"
+OUTROOT="${FINAL_BASE}/${MODEL_TAG}/${PDB_STEM}"
+METRICS_ONE="${OUTROOT}/metrics_seq_$(printf '%04d' "$seq_index").tsv"
+
+[[ -s "$SEQ_FILE" ]] || { echo "ERROR: missing sequence file $SEQ_FILE" >&2; exit 3; }
+[[ -s "$REF_PDB" ]] || { echo "ERROR: missing ref pdb $REF_PDB" >&2; exit 3; }
+
+module load mamba/latest
+
+MPNN_ENV="${MPNN_ENV:-ligandmpnn}"
+OMEGAFOLD_ENV="${OMEGAFOLD_ENV:-omegafold}"
+ESM_ENV="${ESM_ENV:-/packages/envs/esm-3.2.3-cuda-12.9.0}"
+COLABFOLD_ENV="${COLABFOLD_ENV:-/packages/envs/colabfold-1.5.5}"
+BOLTZ_ENV="${BOLTZ_ENV:-boltz}"
+
+run_in_env() {
+  local env="$1"; shift
+  set +u
+  source activate "$env"
+  set -u
+  "$@"
+}
+
+bb_rmsd() {
+  local ref="$1"
+  local pred="$2"
+  run_in_env "$MPNN_ENV" python - "$ref" "$pred" <<'PY'
+import sys
+from Bio.PDB import PDBParser, Superimposer
+ref_path, pred_path = sys.argv[1], sys.argv[2]
+p=PDBParser(QUIET=True)
+ref=p.get_structure("ref", ref_path)
+prd=p.get_structure("prd", pred_path)
+def cas(struct):
+  out=[]
+  for model in struct:
+    for chain in model:
+      for res in chain:
+        if "CA" in res:
+          out.append(res["CA"])
+    break
+  return out
+r=cas(ref); q=cas(prd)
+n=min(len(r),len(q))
+if n < 3:
+  print("nan")
+  sys.exit(0)
+sup=Superimposer()
+sup.set_atoms(r[:n], q[:n])
+print(f"{sup.rms:.4f}")
+PY
+}
+
+plddt_proxy() {
+  local pdb="$1"
+  run_in_env "$MPNN_ENV" python - "$pdb" <<'PY'
+import sys, statistics
+vals=[]
+with open(sys.argv[1]) as f:
+  for line in f:
+    if not line.startswith("ATOM"): continue
+    atom=line[12:16].strip()
+    if atom != "CA": continue
+    try:
+      b=float(line[60:66])
+    except:
+      continue
+    vals.append(b)
+if not vals:
+  print("nan")
+else:
+  print(f"{statistics.mean(vals):.2f}")
+PY
+}
+
+append_one() {
+  local seq_idx="$1"
+  local tool="$2"
+  local pred_pdb="$3"
+  local seconds="$4"
+  local rmsd plddt
+  rmsd="$(bb_rmsd "$REF_PDB" "$pred_pdb")"
+  plddt="$(plddt_proxy "$pred_pdb")"
+  echo -e "${seq_idx}\t${tool}\t${rmsd}\t${plddt}\t${seconds}\t${pred_pdb}" >> "$METRICS_ONE"
+}
+
+run_omegafold() {
+  local fasta="$1"
+  local outdir="$2"
+  mkdir -p "$outdir"
+  local start=$SECONDS
+  run_in_env "$OMEGAFOLD_ENV" omegafold "$fasta" "$outdir" >/dev/null 2>&1 || true
+  local pred
+  pred="$(find "$outdir" -type f -name "*.pdb" -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2-)"
+  [[ -s "$pred" ]] || return 11
+  echo "$pred|$((SECONDS-start))"
+}
+
+run_esmfold_transformer() {
+  local fasta="$1"
+  local out_pdb="$2"
+  SECONDS=0
+
+  run_in_env "$ESM_ENV" python - <<PY
+import re, torch, numpy as np
+from transformers import EsmForProteinFolding, AutoTokenizer
+
+FASTA = "${fasta}"
+OUTPDB = "${out_pdb}"
+OUTPLDDT = "${out_pdb}.plddt"
+
+def read_fasta(path):
+    seq = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith(">"): continue
+            seq.append(line.strip())
+    s = "".join(seq).upper()
+    s = re.sub(r"[^ACDEFGHIKLMNPQRSTVWY]", "", s)
+    return s
+
+seq = read_fasta(FASTA)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_name = "facebook/esmfold_v1"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = EsmForProteinFolding.from_pretrained(model_name).to(device)
+model.eval()
+
+with torch.no_grad():
+    inputs = tokenizer([seq], return_tensors="pt", add_special_tokens=False)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+        outputs = model(**inputs)
+
+    pdb_list = model.output_to_pdb(outputs)
+
+    plddt = outputs["plddt"].cpu().numpy()[0]
+    mean_plddt = float(np.mean(plddt))
+    pdb_text = pdb_list[0] if isinstance(pdb_list, (list, tuple)) else pdb_list
+
+with open(OUTPDB, "w") as f:
+    f.write(pdb_text)
+
+with open(OUTPLDDT, "w") as f:
+    f.write(f"{mean_plddt:.2f}\\n")
+PY
+
+  echo "${out_pdb}|$SECONDS"
+}
+
+run_colabfold() {
+  local fasta="$1"
+  local outdir="$2"
+  local preset="$3"
+  mkdir -p "$outdir"
+  local start=$SECONDS
+  export COLABFOLD_HOME="$SCRATCH_BASE/colabfold_cache"
+  mkdir -p "$COLABFOLD_HOME"
+  run_in_env "$COLABFOLD_ENV" colabfold_batch \
+    --num-models 1 \
+    --amber \
+    --use-gpu-relax \
+    --templates \
+    --num-recycle 3 \
+    --data "${COLABFOLD_HOME}" \
+    --msa-mode "$preset" \
+    "$fasta" "$outdir" >&2
+  local pred
+  pred="$(find "$outdir" -type f -name "*.pdb" -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2-)"
+  [[ -n "$pred" && -s "$pred" ]] || return 13
+  printf '%s|%s\n' "$pred" "$((SECONDS-start))"
+}
+
+write_boltz_fasta() {
+  local in_fasta="$1"
+  local out_fasta="$2"
+  {
+    echo ">A|protein|empty"
+    awk 'NR>1{printf "%s", $0} END{print ""}' "$in_fasta"
+  } > "$out_fasta"
+}
+
+run_boltz_nomsa() {
+  local fasta="$1"
+  local outdir="$2"
+  mkdir -p "$outdir"
+  local start=$SECONDS
+  run_in_env "$BOLTZ_ENV" boltz predict "$fasta" \
+    --out_dir "$outdir" \
+    --output_format pdb \
+    --accelerator gpu \
+    --devices 1 \
+    --num_workers 2 \
+    --override >&2
+  local pred
+  pred="$(find "$outdir" -type f -name "*.pdb" -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2-)"
+  [[ -n "$pred" && -s "$pred" ]] || return 14
+  printf '%s|%s\n' "$pred" "$((SECONDS-start))"
+}
+
+run_boltz_msa() {
+  local fasta="$1"
+  local outdir="$2"
+  mkdir -p "$outdir"
+  local start=$SECONDS
+  local yaml="${outdir}/input.yaml"
+  run_in_env "$BOLTZ_ENV" python - "$fasta" "$yaml" <<'PY'
+import sys, textwrap
+fasta, yaml_path = sys.argv[1], sys.argv[2]
+seq = open(fasta).read().splitlines()[1].strip()
+yaml = f"""\
+version: 1
+sequences:
+  - protein:
+      id: "A"
+      sequence: "{seq}"
+"""
+open(yaml_path, "w").write(textwrap.dedent(yaml))
+PY
+  run_in_env "$BOLTZ_ENV" boltz predict "$yaml" \
+    --out_dir "$outdir" \
+    --output_format pdb \
+    --accelerator gpu \
+    --devices 1 \
+    --num_workers 2 \
+    --override \
+    --use_msa_server >&2
+  local pred
+  pred="$(find "$outdir" -type f -name "*.pdb" -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2-)"
+  [[ -n "$pred" && -s "$pred" ]] || return 15
+  printf '%s|%s\n' "$pred" "$((SECONDS-start))"
+}
+
+echo -e "seq_idx\ttool\trmsd_bb\tplddt\tseconds\tpred_pdb" > "$METRICS_ONE"
+
+SEQ_PAD="$(printf '%04d' "$seq_index")"
+SEQ_OUT="${OUTROOT}/predictions/seq_${SEQ_PAD}"
+mkdir -p "$SEQ_OUT"
+
+IFS='|' read -r pred sec < <(run_omegafold "$SEQ_FILE" "$SEQ_OUT/omegafold")
+append_one "$seq_index" "omegafold" "$pred" "$sec"
+
+esm_dir="$SEQ_OUT/esmfold"
+mkdir -p "$esm_dir"
+IFS='|' read -r pred sec < <(run_esmfold_transformer "$SEQ_FILE" "$esm_dir/pred.pdb")
+append_one "$seq_index" "esmfold" "$pred" "$sec"
+
+IFS='|' read -r pred sec < <(run_colabfold "$SEQ_FILE" "$SEQ_OUT/colab_nmsa" "single_sequence")
+append_one "$seq_index" "colab_nmsa" "$pred" "$sec"
+
+IFS='|' read -r pred sec < <(run_colabfold "$SEQ_FILE" "$SEQ_OUT/colab_msa" "mmseqs2_uniref_env")
+append_one "$seq_index" "colab_msa" "$pred" "$sec"
+
+BOLTZ_FASTA="${SEQ_OUT}/boltz_seq_${SEQ_PAD}.fasta"
+write_boltz_fasta "$SEQ_FILE" "$BOLTZ_FASTA"
+
+IFS='|' read -r pred sec < <(run_boltz_nomsa "$BOLTZ_FASTA" "$SEQ_OUT/boltz_nmsa")
+append_one "$seq_index" "boltz_nmsa" "$pred" "$sec"
+
+IFS='|' read -r pred sec < <(run_boltz_msa "$SEQ_FILE" "$SEQ_OUT/boltz_msa")
+append_one "$seq_index" "boltz_msa" "$pred" "$sec"
+
+rm -rf "$SEQ_OUT"
+
+echo "DONE_SEQ ${PDB_STEM} ${SEQ_PAD}"

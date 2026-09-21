@@ -1,0 +1,44 @@
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+LIST_FILE="${1:-rcsb_pdb_ids_200_random.txt}"
+SBATCH_SCRIPT="${2:-cmsa_only_eval.sbatch}"
+
+if [[ ! -f "$LIST_FILE" ]]; then
+  echo "ERROR: list file not found: $LIST_FILE" >&2
+  exit 1
+fi
+if [[ ! -f "$SBATCH_SCRIPT" ]]; then
+  echo "ERROR: sbatch script not found: $SBATCH_SCRIPT" >&2
+  exit 1
+fi
+
+prev_jobid=""
+
+# Count only non-empty, non-comment lines for nice progress printing
+TOTAL="$(grep -vE '^\s*($|#)' "$LIST_FILE" | wc -l | awk '{print $1}')"
+[[ "${TOTAL}" -gt 0 ]] || { echo "ERROR: no PDB IDs found in $LIST_FILE" >&2; exit 1; }
+
+i=0
+while IFS= read -r pdb || [[ -n "$pdb" ]]; do
+  pdb="$(echo "$pdb" | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]')"
+  [[ -z "$pdb" ]] && continue
+  [[ "$pdb" =~ ^# ]] && continue
+
+  i=$((i+1))
+
+  # Submit cmsa_only_eval.sbatch with:
+  #  -i <index> (so the sbatch script reads the correct line from LIST_FILE)
+  #  LIST_FILE exported into the job environment
+  if [[ -z "$prev_jobid" ]]; then
+    jobid="$(sbatch --export=ALL,LIST_FILE="$LIST_FILE" "$SBATCH_SCRIPT" -i "$i" | awk '{print $4}')"
+  else
+    jobid="$(sbatch --dependency=afterok:"$prev_jobid" --export=ALL,LIST_FILE="$LIST_FILE" "$SBATCH_SCRIPT" -i "$i" | awk '{print $4}')"
+  fi
+
+  echo "Submitted #$i/$TOTAL PDB=$pdb as job $jobid (depends on ${prev_jobid:-none})"
+  prev_jobid="$jobid"
+done < "$LIST_FILE"
+
+echo "Done. Last job in chain: $prev_jobid"

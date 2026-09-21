@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=boltz_only
+#SBATCH --partition=public
+#SBATCH --qos=public
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#SBATCH --output=of_%j.out
+#SBATCH --error=of_%j.err
+
+set -euo pipefail
+SECONDS=0
+
+trap 'ec=$?; echo "ERROR: exit_code=$ec line=$LINENO cmd=$BASH_COMMAND" >&2' ERR
+set -x
+
+# --- BOOTSTRAP ---
+echo "=== BOOTSTRAP START ==="
+echo "date=$(date) host=$(hostname)"
+echo "user=$USER job=${SLURM_JOB_ID:-NA}"
+echo "pwd_before=$(pwd)"
+cd "${SLURM_SUBMIT_DIR:-$HOME}" || exit 1
+echo "pwd_after=$(pwd)"
+
+# --- OVERRIDE BROKEN SYSTEM SITECUSTOMIZE ---
+cat > sitecustomize.py <<'PY'
+# Local sitecustomize to shadow /etc/python/sitecustomize.py
+PY
+export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+
+# --------- CONFIG ----------
+LIST_FILE="${LIST_FILE:-rcsb_pdb_ids_200_random.txt}"
+BOLTZ_ENV="${BOLTZ_ENV:-boltz}"
+PYMOL_ENV="${PYMOL_ENV:-pymol}"
+CHAIN_PREF="${CHAIN_PREF:-A}"
+
+# Optional boltz knobs
+BOLTZ_MODEL="${BOLTZ_MODEL:-}"              # e.g. boltz1 or boltz2; empty -> boltz default
+BOLTZ_ACCELERATOR="${BOLTZ_ACCELERATOR:-gpu}"
+BOLTZ_DEVICES="${BOLTZ_DEVICES:-1}"
+BOLTZ_NUM_WORKERS="${BOLTZ_NUM_WORKERS:-2}"
+BOLTZ_SEED="${BOLTZ_SEED:-}"               # optional integer
+
+# --------- MODULE INIT (SOL/ASU) ----------
+if [[ -f /etc/profile.d/modules.sh ]]; then
+  # shellcheck disable=SC1091
+  source /etc/profile.d/modules.sh
+elif [[ -f /usr/share/Modules/init/bash ]]; then
+  # shellcheck disable=SC1091
+  source /usr/share/Modules/init/bash
+fi
+
+module purge
+module load mamba
+
+# SOL style: use "source activate", not "mamba activate"
+run_in_env() {
+  local env_name="$1"; shift
+  echo ">>> [ENV: $env_name] $*"
+  (
+    set -euo pipefail
+    source activate "$env_name" || { echo "ERROR: could not source activate $env_name" >&2; exit 1; }
+    "$@"
+    source deactivate || true
+  )
+}
+
+usage() {
+  echo "Usage: sbatch $0 <PDB_ID>   OR   sbatch $0 -i <INDEX>" >&2
+  exit 1
+}
+
+# --------- parse args ----------
+PDB_ID=""
+INDEX=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i|--index) INDEX="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *)
+      if [[ -z "$PDB_ID" ]]; then PDB_ID="$1"; shift
+      else echo "Unknown arg: $1" >&2; exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$PDB_ID" ]]; then
+  [[ -n "$INDEX" ]] || usage
+  [[ -f "$LIST_FILE" ]] || { echo "ERROR: LIST_FILE not found: $LIST_FILE" >&2; exit 1; }
+  PDB_ID="$(sed -n "${INDEX}p" "$LIST_FILE" | tr -d ' \t\r\n')"
+fi
+
+[[ -n "$PDB_ID" ]] || { echo "ERROR: empty PDB_ID" >&2; exit 1; }
+
+echo "============================================================"
+echo "PDB_ID=$PDB_ID"
+echo "host=$(hostname) date=$(date)"
+echo "pwd=$(pwd)"
+echo "============================================================"
+
+# --------- output dirs ----------
+OUTDIR="boltz_run_${PDB_ID}"
+mkdir -p "$OUTDIR"
+RAW_PDB="${OUTDIR}/${PDB_ID}.pdb"
+REF_PDB="${OUTDIR}/${PDB_ID}_ref.pdb"
+FASTA="${OUTDIR}/${PDB_ID}.fasta"
+
+BOLTZ_OUT="${OUTDIR}/boltz_out"
+METRICS_TSV="${OUTDIR}/metrics.tsv"
+mkdir -p "$BOLTZ_OUT"
+
+# --------- STEP 1: download original structure (PDB if available; else mmCIF) ----------
+echo ">>> Downloading original structure from RCSB: $PDB_ID"
+
+PDB_URL="https://files.rcsb.org/download/${PDB_ID^^}.pdb"
+CIF_URL="https://files.rcsb.org/download/${PDB_ID^^}.cif"
+CIF_FILE="${OUTDIR}/${PDB_ID}.cif"
+
+download_ok=0
+
+if curl -fL --max-time 60 -o "$RAW_PDB" "$PDB_URL"; then
+  download_ok=1
+  echo ">>> Got PDB: $RAW_PDB"
+else
+  echo ">>> PDB not available. Trying mmCIF..."
+fi
+
+if [[ "$download_ok" -eq 0 ]]; then
+  curl -fL --max-time 60 -o "$CIF_FILE" "$CIF_URL"
+  echo ">>> Got CIF: $CIF_FILE"
+  run_in_env "$PYMOL_ENV" pymol -cq -d "load $CIF_FILE, ref; save $RAW_PDB, ref; quit"
+  echo ">>> Converted CIF -> PDB: $RAW_PDB"
+fi
+
+cp -f "$RAW_PDB" "$REF_PDB"
+ls -lh "$RAW_PDB"
+
+# --------- STEP 2: extract native sequence from PDB to FASTA (inside BOLTZ env so python exists) ----------
+run_in_env "$BOLTZ_ENV" python - "$REF_PDB" "$FASTA" "$CHAIN_PREF" <<'PY'
+import sys
+
+pdb_path, fasta_path, chain_pref = sys.argv[1], sys.argv[2], sys.argv[3]
+
+aa3_to_1 = {
+ 'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C','GLN':'Q','GLU':'E','GLY':'G','HIS':'H',
+ 'ILE':'I','LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P','SER':'S','THR':'T','TRP':'W',
+ 'TYR':'Y','VAL':'V'
+}
+
+chains = {}
+seen = set()
+
+with open(pdb_path) as f:
+    for line in f:
+        if not line.startswith("ATOM"):
+            continue
+        resn = line[17:20].strip()
+        ch = (line[21].strip() or "A")
+        try:
+            resi = int(line[22:26])
+        except Exception:
+            continue
+        key = (ch, resi)
+        if key in seen:
+            continue
+        seen.add(key)
+        if resn in aa3_to_1:
+            chains.setdefault(ch, []).append((resi, aa3_to_1[resn]))
+
+if not chains:
+    raise SystemExit("NO_PROTEIN_ATOMS")
+
+def seq_from(items):
+    return "".join(a for _, a in sorted(items, key=lambda x: x[0]))
+
+# choose requested chain if present, else the longest chain
+if chain_pref in chains and chains[chain_pref]:
+    use_chain = chain_pref
+else:
+    use_chain = max(chains.items(), key=lambda kv: len(kv[1]))[0]
+
+seq = seq_from(chains[use_chain])
+if not seq:
+    raise SystemExit("EMPTY_SEQUENCE")
+
+with open(fasta_path, "w") as out:
+    # Boltz expects: >{record_id}|{entity_type}|{name}
+    out.write(f">{use_chain}|protein|empty\n")
+    out.write(seq + "\n")
+
+print(f"Wrote FASTA for chain {use_chain} length={len(seq)} -> {fasta_path}")
+PY
+# --------- STEP 3: Boltz prediction ----------
+echo ">>> Running Boltz"
+BOLTZ_CMD=(boltz predict "$FASTA"
+  --out_dir "$BOLTZ_OUT"
+  --output_format pdb
+  --accelerator "$BOLTZ_ACCELERATOR"
+  --devices "$BOLTZ_DEVICES"
+  --num_workers "$BOLTZ_NUM_WORKERS"
+  --override
+)
+
+if [[ -n "$BOLTZ_MODEL" ]]; then
+  BOLTZ_CMD+=(--model "$BOLTZ_MODEL")
+fi
+if [[ -n "$BOLTZ_SEED" ]]; then
+  BOLTZ_CMD+=(--seed "$BOLTZ_SEED")
+fi
+
+run_in_env "$BOLTZ_ENV" "${BOLTZ_CMD[@]}"
+
+# Boltz outputs under out_dir/boltz_results_<input_basename>/predictions/<input_basename>/...
+PRED_PDB="$(find "$BOLTZ_OUT" -type f -name "*.pdb" -printf "%T@ %p\n" 2>/dev/null \
+  | sort -nr | head -n 1 | awk '{print $2}')"
+if [[ -z "${PRED_PDB:-}" || ! -f "$PRED_PDB" ]]; then
+  echo "ERROR: No predicted PDB found under $BOLTZ_OUT/predictions" >&2
+  exit 1
+fi
+echo "Predicted PDB: $PRED_PDB"
+
+# --------- STEP 4: RMSD + pLDDT via PyMOL ----------
+# Boltz pLDDT is written into the B-factor field when output_format is PDB.
+echo ">>> Evaluating RMSD + pLDDT"
+RMSD_SCRIPT="$(mktemp /tmp/boltz_rmsd.XXXXXX.py)"
+cat > "$RMSD_SCRIPT" <<'PY'
+from pymol import cmd
+import sys, math, os
+
+ref = sys.argv[1]
+pred = sys.argv[2]
+
+cmd.reinitialize()
+cmd.load(ref, "ref")
+cmd.load(pred, "pred")
+
+res = cmd.align("pred and name N+CA+C+O", "ref and name N+CA+C+O", cycles=0)
+rmsd = res[0] if isinstance(res, (list, tuple)) else float("nan")
+
+# mean pLDDT from CA B-factors
+b = []
+m = cmd.get_model("pred and name CA")
+for a in m.atom:
+    try:
+        b.append(float(a.b))
+    except Exception:
+        pass
+avg_plddt = sum(b)/len(b) if b else float("nan")
+
+rmsd_s = f"{rmsd:.3f}" if not math.isnan(rmsd) else "NA"
+plddt_s = f"{avg_plddt:.1f}" if not math.isnan(avg_plddt) else "NA"
+pdb_id = os.path.basename(ref).split("_")[0].split(".")[0]
+
+print("pdb_id\trmsd\tplddt\tpred_pdb")
+print(f"{pdb_id}\t{rmsd_s}\t{plddt_s}\t{pred}")
+PY
+
+run_in_env "$PYMOL_ENV" pymol -cq "$RMSD_SCRIPT" -- "$REF_PDB" "$PRED_PDB" | tee "$METRICS_TSV"
+rm -f "$RMSD_SCRIPT"
+
+echo "SECONDS=$SECONDS"

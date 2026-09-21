@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=colab_msa
+#SBATCH --partition=public
+#SBATCH --qos=public
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#SBATCH --output=of_%j.out
+#SBATCH --error=of_%j.err
+
+set -eo pipefail
+SECONDS=0
+
+############################################
+# Expected usage:
+# sbatch --export=ALL,LIST_FILE=... cmsa_only_eval.sbatch -i <INDEX>
+############################################
+
+# --- Sol system ColabFold env ---
+module load mamba/latest
+source activate /packages/envs/colabfold-1.5.5
+
+which colabfold_batch || { echo "ERROR: colabfold_batch not found"; exit 3; }
+python3 -c "import jax, haiku; print('JAX', jax.__version__, 'HAIKU', haiku.__version__)" || {
+  echo "ERROR: jax/haiku import failed in colabfold-1.5.5 env"; exit 4;
+}
+
+# Reuse weights/MSA cache across all jobs
+export COLABFOLD_HOME="${SLURM_SUBMIT_DIR}/colabfold_cache"
+mkdir -p "${COLABFOLD_HOME}"
+
+INDEX=""
+while getopts ":i:" opt; do
+  case "${opt}" in
+    i) INDEX="${OPTARG}" ;;
+    *) echo "Usage: $0 -i <index>" >&2; exit 2 ;;
+  esac
+done
+
+[[ -z "${INDEX}" ]] && { echo "Missing -i INDEX"; exit 2; }
+[[ -z "${LIST_FILE:-}" ]] && { echo "LIST_FILE not set"; exit 2; }
+
+PDB_ID="$(sed -n "${INDEX}p" "${LIST_FILE}" | tr -d ' \t\r\n' | tr '[:lower:]' '[:upper:]')"
+[[ -z "${PDB_ID}" ]] && { echo "Invalid PDB index"; exit 2; }
+
+echo "Running PDB: ${PDB_ID}"
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID}"
+
+BASE_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
+WORKDIR="${BASE_DIR}/runs/${PDB_ID}_${SLURM_JOB_ID}"
+mkdir -p "${WORKDIR}"
+cd "${WORKDIR}"
+
+RAW_CIF="${PDB_ID}.cif"
+RAW_PDB="${PDB_ID}.pdb"
+CHAINA_PDB="${PDB_ID}_chainA.pdb"
+FASTA="${PDB_ID}_chainA.fasta"
+
+# ----------------------------
+# Fetch structure (CIF first; fallback PDB)
+# ----------------------------
+CIF_URL="https://files.rcsb.org/download/${PDB_ID}.cif"
+PDB_URL="https://files.rcsb.org/download/${PDB_ID}.pdb"
+
+if curl -fsSL --max-time 60 -o "${RAW_CIF}" "${CIF_URL}" && [[ $(wc -c < "${RAW_CIF}") -gt 500 ]]; then
+  echo ">>> Got CIF: ${RAW_CIF}"
+  # Convert CIF -> PDB via BioPython (no pymol needed)
+  python3 - <<PY
+from Bio.PDB import MMCIFParser, PDBIO
+parser = MMCIFParser(QUIET=True)
+s = parser.get_structure("${PDB_ID}", "${RAW_CIF}")
+io = PDBIO(); io.set_structure(s); io.save("${RAW_PDB}")
+PY
+else
+  echo ">>> CIF not available; trying PDB..."
+  curl -fsSL --max-time 60 -o "${RAW_PDB}" "${PDB_URL}"
+  echo ">>> Got PDB: ${RAW_PDB}"
+fi
+
+[[ -s "${RAW_PDB}" ]] || { echo "ERROR: no structure file downloaded for ${PDB_ID}"; exit 10; }
+
+# ----------------------------
+# Force all chains -> A
+# ----------------------------
+awk '
+BEGIN{OFS=""}
+/^ATOM  |^HETATM/{
+  if(length($0)>=22){print substr($0,1,21)"A"substr($0,23);next}
+}
+{print}
+' "${RAW_PDB}" > "${CHAINA_PDB}"
+
+# ----------------------------
+# Extract FASTA (chain A)
+# ----------------------------
+python3 - <<PY
+from Bio.SeqUtils import seq1
+seen=set(); res=[]
+with open("${CHAINA_PDB}") as f:
+    for line in f:
+        if not line.startswith("ATOM  "): continue
+        if line[21]!="A": continue
+        resn=line[17:20].strip()
+        try: resi=int(line[22:26])
+        except: continue
+        key=(resi,resn)
+        if key in seen: continue
+        seen.add(key)
+        aa=seq1(resn,custom_map={"MSE":"M"},undef_code="X")
+        if aa!="X": res.append((resi,aa))
+res.sort()
+seq="".join(a for _,a in res)
+with open("${FASTA}","w") as o:
+    o.write(f">${PDB_ID}_A\n{seq}\n")
+print("Sequence length:",len(seq))
+PY
+
+# ----------------------------
+# Run ColabFold (MSA enabled)
+# ----------------------------
+OUTDIR="${WORKDIR}/cf_out"
+mkdir -p "${OUTDIR}"
+
+colabfold_batch \
+  --msa-mode mmseqs2_uniref_env \
+  --num-models 1 \
+  --num-recycle 3 \
+  "${FASTA}" \
+  "${OUTDIR}"
+
+# ----------------------------
+# Metrics: CA RMSD + mean pLDDT (robust parsing)
+# ----------------------------
+PRED_PDB="$(ls -1 ${OUTDIR}/*_rank_001_*.pdb | head -n1)"
+[[ -s "${PRED_PDB}" ]] || { echo "ERROR: predicted PDB not found"; exit 11; }
+
+export NATIVE_PDB="${CHAINA_PDB}"
+export PRED_PDB="${PRED_PDB}"
+
+python3 - <<'PY'
+import os, math
+import numpy as np
+
+native_pdb = os.environ["NATIVE_PDB"]
+pred_pdb   = os.environ["PRED_PDB"]
+
+def read_ca(pdb_path, want_plddt=False):
+    coords=[]
+    plddt=[]
+    with open(pdb_path) as f:
+        for line in f:
+            if not line.startswith("ATOM  "):
+                continue
+            atom = line[12:16].strip()
+            if atom not in ("N","CA","C"):
+                continue
+            try:
+                x=float(line[30:38]); y=float(line[38:46]); z=float(line[46:54])
+            except:
+                continue
+            coords.append([x,y,z])
+            if want_plddt:
+                try:
+                    plddt.append(float(line[60:66]))
+                except:
+                    pass
+    coords=np.array(coords,dtype=float)
+    mean_plddt=float(np.mean(plddt)) if plddt else float("nan")
+    return coords, mean_plddt
+
+def kabsch_rmsd(P,Q):
+    n=min(len(P),len(Q))
+    P=P[:n].copy(); Q=Q[:n].copy()
+    P-=P.mean(axis=0); Q-=Q.mean(axis=0)
+    C=P.T@Q
+    V,S,Wt=np.linalg.svd(C)
+    d=np.sign(np.linalg.det(V@Wt))
+    D=np.diag([1,1,d])
+    U=V@D@Wt
+    P_rot=P@U
+    diff=P_rot-Q
+    return math.sqrt((diff*diff).sum()/n)
+
+native_ca,_ = read_ca(native_pdb, want_plddt=False)
+pred_ca,mean_plddt = read_ca(pred_pdb, want_plddt=True)
+
+if len(native_ca)==0 or len(pred_ca)==0:
+    raise SystemExit("ERROR: no CA atoms found for RMSD calc")
+
+rmsd=kabsch_rmsd(native_ca,pred_ca)
+
+print("\n===== FINAL METRICS =====")
+print("Backbone_RMSD_CA:", round(rmsd,3))
+print("Mean_pLDDT:", round(mean_plddt,2))
+PY
+
+echo "Seconds_runtime: ${SECONDS}"
+echo "===== JOB COMPLETE ====="

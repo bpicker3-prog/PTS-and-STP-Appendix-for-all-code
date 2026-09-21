@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=esmfold
+#SBATCH --partition=public
+#SBATCH --qos=public
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#SBATCH --output=esm_%j.out
+#SBATCH --error=esm_%j.err
+
+set -eo pipefail
+SECONDS=0
+trap 'ec=$?; echo "ERROR: exit_code=$ec line=$LINENO cmd=$BASH_COMMAND" >&2' ERR
+set -x
+
+echo "=== BOOTSTRAP START ==="
+echo "date=$(date) host=$(hostname)"
+cd "${SLURM_SUBMIT_DIR:-$HOME}" || exit 1
+
+# Shadow broken system sitecustomize by providing an empty one locally
+cat > sitecustomize.py <<'PY'
+# shadow broken system sitecustomize
+PY
+
+export PYTHONPATH="$PWD"
+export PYTHONNOUSERSITE=1
+export PIP_NO_USER=1
+
+LIST_FILE="${LIST_FILE:-rcsb_pdb_ids_200_random.txt}"
+ESM_ENV="/packages/envs/esm-3.2.3-cuda-12.9.0"
+PYMOL_ENV="${PYMOL_ENV:-pymol}"
+CHAIN_PREF="${CHAIN_PREF:-A}"
+
+# --- modules ---
+if [[ -f /etc/profile.d/modules.sh ]]; then
+  source /etc/profile.d/modules.sh
+fi
+module purge
+module load mamba
+
+run_in_env() {
+  local env_spec="$1"; shift
+  (
+    set -euo pipefail
+
+    export PYTHONNOUSERSITE=1
+    export PIP_NO_USER=1
+    export PYTHONPATH="$PWD"
+
+    source /packages/apps/mamba/2.0.8/etc/profile.d/conda.sh
+
+    # activate (allow either env name or absolute prefix)
+    set +u
+    conda activate "$env_spec"
+    set -u
+
+    # force correct bin first
+    if [[ "$env_spec" == /* ]]; then
+      export PATH="$env_spec/bin:$PATH"
+    else
+      export PATH="$CONDA_PREFIX/bin:$PATH"
+    fi
+    hash -r
+
+    echo "ENV_SPEC=$env_spec"
+    which python
+    python -V
+
+    "$@"
+
+    set +u
+    conda deactivate
+    set -u
+  )
+}
+
+# --- parse args ---
+PDB_ID=""
+INDEX=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i|--index) INDEX="$2"; shift 2 ;;
+    *) PDB_ID="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$PDB_ID" ]]; then
+  PDB_ID="$(sed -n "${INDEX}p" "$LIST_FILE" | tr -d ' \t\r\n')"
+fi
+
+[[ -n "$PDB_ID" ]] || { echo "ERROR: empty PDB_ID"; exit 1; }
+
+OUTDIR="esmfold_run_${PDB_ID}"
+mkdir -p "$OUTDIR"
+RAW_PDB="${OUTDIR}/${PDB_ID}.pdb"
+REF_PDB="${OUTDIR}/${PDB_ID}_ref.pdb"
+FASTA="${OUTDIR}/${PDB_ID}.fasta"
+PRED_PDB="${OUTDIR}/${PDB_ID}_esmfold.pdb"
+METRICS_TSV="${OUTDIR}/metrics.tsv"
+
+# --- download structure ---
+echo ">>> Downloading reference structure from RCSB: $PDB_ID"
+
+PDB_URL="https://files.rcsb.org/download/${PDB_ID^^}.pdb"
+CIF_URL="https://files.rcsb.org/download/${PDB_ID^^}.cif"
+CIF_FILE="${OUTDIR}/${PDB_ID}.cif"
+
+download_ok=0
+
+if curl -fL --max-time 60 -o "$RAW_PDB" "$PDB_URL"; then
+  download_ok=1
+  echo ">>> Got PDB: $RAW_PDB"
+else
+  echo ">>> PDB not available (or 404). Trying mmCIF..."
+fi
+
+if [[ "$download_ok" -eq 0 ]]; then
+  curl -fL --max-time 60 -o "$CIF_FILE" "$CIF_URL"
+  echo ">>> Got CIF: $CIF_FILE"
+  # convert to PDB so the rest of your pipeline stays the same
+  run_in_env "$PYMOL_ENV" pymol -cq -d "load $CIF_FILE, ref; save $RAW_PDB, ref; quit"
+  echo ">>> Converted CIF -> PDB: $RAW_PDB"
+fi
+
+cp -f "$RAW_PDB" "$REF_PDB"
+ls -lh "$REF_PDB"
+
+# --- extract sequence (write a helper script instead of python -) ---
+FASTA_SCRIPT="${OUTDIR}/write_fasta.py"
+cat > "$FASTA_SCRIPT" <<'PY'
+import sys
+pdb_path, fasta_path, chain_pref = sys.argv[1:4]
+aa = {'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C','GLN':'Q','GLU':'E','GLY':'G',
+      'HIS':'H','ILE':'I','LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P',
+      'SER':'S','THR':'T','TRP':'W','TYR':'Y','VAL':'V'}
+chains = {}
+seen=set()
+for line in open(pdb_path):
+    if line.startswith("ATOM"):
+        resn=line[17:20].strip()
+        ch=line[21].strip() or "A"
+        try: resi=int(line[22:26])
+        except: continue
+        if (ch,resi) in seen: continue
+        seen.add((ch,resi))
+        if resn in aa:
+            chains.setdefault(ch,[]).append((resi,aa[resn]))
+use = chain_pref if chain_pref in chains else max(chains,key=lambda k:len(chains[k]))
+seq="".join(a for _,a in sorted(chains[use]))
+open(fasta_path,"w").write(f">{use}\n{seq}\n")
+print("Wrote FASTA",len(seq))
+PY
+
+run_in_env "$ESM_ENV" python "$FASTA_SCRIPT" "$REF_PDB" "$FASTA" "$CHAIN_PREF"
+
+# --- run ESMFold (write a helper script instead of python -) ---
+FOLD_SCRIPT="${OUTDIR}/run_esmfold.py"
+cat > "$FOLD_SCRIPT" <<'PY'
+import os
+import torch
+
+fasta_path = os.environ["FASTA"]
+out_pdb    = os.environ["PRED_PDB"]
+
+seq = open(fasta_path).read().splitlines()[1].strip()
+
+def fold_with_fair_esm(seq: str) -> str:
+    # fair-esm / facebookresearch esm API
+    from esm.pretrained import esmfold_v1
+    model = esmfold_v1().eval().cuda()
+    # optional: reduce memory if needed
+    # model.set_chunk_size(128)
+    with torch.no_grad():
+        return model.infer_pdb(seq)
+
+def fold_with_transformers(seq: str) -> str:
+    # Hugging Face Transformers API using facebook/esmfold_v1
+    from transformers import AutoTokenizer, EsmForProteinFolding
+    tok = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
+    mdl = EsmForProteinFolding.from_pretrained("facebook/esmfold_v1").eval().cuda()
+
+    inputs = tok([seq], return_tensors="pt", add_special_tokens=False)
+    inputs = {k: v.cuda() for k, v in inputs.items()}
+
+    with torch.no_grad():
+        # fp16 can help on A100; comment out if it causes issues
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            out = mdl(**inputs)
+
+    # Convert model output to PDB text
+    # Transformers provides helpers on the model output for folding models.
+    pdb_str = mdl.output_to_pdb(out)[0]
+    return pdb_str
+
+try:
+    pdb = fold_with_fair_esm(seq)
+    backend = "fair-esm (esm.pretrained.esmfold_v1)"
+except Exception as e1:
+    try:
+        pdb = fold_with_transformers(seq)
+        backend = "transformers (facebook/esmfold_v1)"
+    except Exception as e2:
+        raise RuntimeError(
+            "Failed with both backends.\n"
+            f"fair-esm error: {e1}\n"
+            f"transformers error: {e2}\n"
+        )
+
+open(out_pdb, "w").write(pdb)
+print(f"Wrote {out_pdb} via {backend} (len={len(pdb)})")
+PY
+
+FASTA="$FASTA" PRED_PDB="$PRED_PDB" run_in_env "$ESM_ENV" python "$FOLD_SCRIPT"
+# --- RMSD + pLDDT ---
+RMSD_SCRIPT="${OUTDIR}/rmsd_plddt.py"
+cat > "$RMSD_SCRIPT" <<'PY'
+from pymol import cmd
+import sys, os
+
+ref, pred, seconds = sys.argv[1:4]
+
+cmd.reinitialize()
+cmd.load(ref, "ref")
+cmd.load(pred, "pred")
+
+r = cmd.align("pred and name N+CA+C+O", "ref and name N+CA+C+O", cycles=0)[0]
+b = [a.b for a in cmd.get_model("pred and name CA").atom]
+plddt = sum(b) / len(b) if b else float("nan")
+
+pdb_id = os.path.basename(ref).split("_")[0]
+print("pdb_id\trmsd\tplddt\tseconds")
+print(f"{pdb_id}\t{r:.3f}\t{plddt:.1f}\t{seconds}")
+PY
+
+run_in_env "$PYMOL_ENV" pymol -cq "$RMSD_SCRIPT" -- "$REF_PDB" "$PRED_PDB" "$SECONDS" | tee "$METRICS_TSV"
+
+echo "SECONDS=$SECONDS"
