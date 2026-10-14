@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+
+import csv
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =========================================================
+# PATHS
+# =========================================================
+
+BASE_DIR = os.path.expanduser(
+    "~/bucket_lists/mutation_profiles_summary"
+)
+
+OUTPUT_DIR = os.path.expanduser(
+    "~/bucket_lists"
+)
+
+# =========================================================
+# CONDITIONS
+# =========================================================
+
+MODELS = ["protein", "ligand", "soluble"]
+
+STRUCTURES = [
+    "helix_rich",
+    "mixed",
+    "sheet_rich"
+]
+
+MODEL_NAMES = {
+    "protein": "ProteinMPNN",
+    "ligand": "LigandMPNN",
+    "soluble": "SolubleMPNN"
+}
+
+STRUCTURE_NAMES = {
+    "helix_rich": "Helix",
+    "mixed": "Mixed",
+    "sheet_rich": "Sheet"
+}
+
+# =========================================================
+# READ TRANSITION MATRIX
+# =========================================================
+
+def read_matrix(filename):
+
+    with open(filename, newline="") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+
+    if len(rows) < 2:
+        raise ValueError(
+            "File appears empty: {}".format(filename)
+        )
+
+    header = rows[0]
+
+    # Expected:
+    #
+    # ,A,V,L,I,...
+    # A,0.4,0.1,...
+    #
+    column_labels = [
+        x.strip() for x in header[1:]
+    ]
+
+    row_labels = []
+    matrix = []
+
+    for row in rows[1:]:
+
+        if not row:
+            continue
+
+        row_labels.append(
+            row[0].strip()
+        )
+
+        values = []
+
+        for value in row[1:]:
+
+            value = value.strip()
+
+            if value == "":
+                values.append(0.0)
+                continue
+
+            try:
+                values.append(float(value))
+            except ValueError:
+                values.append(0.0)
+
+        matrix.append(values)
+
+    return (
+        row_labels,
+        column_labels,
+        np.asarray(matrix, dtype=float)
+    )
+
+# =========================================================
+# SHANNON ENTROPY
+# =========================================================
+
+def shannon_entropy(row):
+
+    p = np.asarray(row, dtype=float)
+
+    # Ignore zero probabilities.
+    p = p[p > 0]
+
+    if len(p) == 0:
+        return np.nan
+
+    # Re-normalize in case of tiny rounding differences.
+    p = p / np.sum(p)
+
+    return float(
+        -np.sum(p * np.log2(p))
+    )
+
+# =========================================================
+# CALCULATE ENTROPY
+# =========================================================
+
+heatmap_rows = []
+heatmap_labels = []
+results = []
+
+aa_order = None
+
+print()
+print("READING TRANSITION MATRICES")
+print("-" * 70)
+
+# Model first:
+#
+# ProteinMPNN Helix
+# ProteinMPNN Mixed
+# ProteinMPNN Sheet
+#
+# LigandMPNN Helix
+# ...
+
+for model in MODELS:
+
+    for structure in STRUCTURES:
+
+        filename = os.path.join(
+            BASE_DIR,
+            structure,
+            model,
+            "aa_transition_matrix_row_norm.csv"
+        )
+
+        print(
+            "{:<12s} {:<12s} {}".format(
+                MODEL_NAMES[model],
+                STRUCTURE_NAMES[structure],
+                filename
+            )
+        )
+
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(
+                "Could not find:\n{}".format(filename)
+            )
+
+        row_labels, column_labels, matrix = read_matrix(
+            filename
+        )
+
+        if matrix.shape != (20, 20):
+
+            raise ValueError(
+                "{} has shape {}; expected (20, 20)".format(
+                    filename,
+                    matrix.shape
+                )
+            )
+
+        # Ensure amino-acid ordering is consistent.
+        if aa_order is None:
+
+            aa_order = row_labels
+
+        elif row_labels != aa_order:
+
+            raise ValueError(
+                "Amino-acid row order differs in:\n{}".format(
+                    filename
+                )
+            )
+
+        entropies = []
+
+        for amino_acid, transition_row in zip(
+            row_labels,
+            matrix
+        ):
+
+            H = shannon_entropy(
+                transition_row
+            )
+
+            entropies.append(H)
+
+            results.append({
+                "model": MODEL_NAMES[model],
+                "structure": STRUCTURE_NAMES[structure],
+                "amino_acid": amino_acid,
+                "entropy_bits": H
+            })
+
+        heatmap_rows.append(
+            entropies
+        )
+
+        heatmap_labels.append(
+            "{} - {}".format(
+                MODEL_NAMES[model],
+                STRUCTURE_NAMES[structure]
+            )
+        )
+
+heatmap = np.asarray(
+    heatmap_rows,
+    dtype=float
+)
+
+# =========================================================
+# EXPORT ALL 180 ENTROPY VALUES
+# =========================================================
+
+csv_output = os.path.join(
+    OUTPUT_DIR,
+    "figure5_entropy_values.csv"
+)
+
+with open(csv_output, "w", newline="") as f:
+
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "model",
+            "structure",
+            "amino_acid",
+            "entropy_bits"
+        ]
+    )
+
+    writer.writeheader()
+
+    for result in results:
+        writer.writerow(result)
+
+# =========================================================
+# PRINT SUMMARY
+# =========================================================
+
+print()
+print("MEAN ENTROPY BY CONDITION")
+print("-" * 70)
+
+for label, values in zip(
+    heatmap_labels,
+    heatmap
+):
+
+    print(
+        "{:<30s} mean={:.4f} bits".format(
+            label,
+            np.mean(values)
+        )
+    )
+
+print()
+print("ENTROPY RANGE")
+print("-" * 70)
+
+print(
+    "Minimum observed entropy: {:.4f} bits".format(
+        np.nanmin(heatmap)
+    )
+)
+
+print(
+    "Maximum observed entropy: {:.4f} bits".format(
+        np.nanmax(heatmap)
+    )
+)
+
+print(
+    "Theoretical maximum for 20 amino acids: {:.4f} bits".format(
+        np.log2(20)
+    )
+)
+
+# =========================================================
+# FIGURE
+# =========================================================
+
+fig, ax = plt.subplots(
+    figsize=(12, 6)
+)
+
+im = ax.imshow(
+    heatmap,
+    aspect="auto",
+    interpolation="nearest",
+    vmin=0,
+    vmax=np.log2(20)
+)
+
+# ---------------------------------------------------------
+# X axis
+# ---------------------------------------------------------
+
+ax.set_xticks(
+    np.arange(len(aa_order))
+)
+
+ax.set_xticklabels(
+    aa_order,
+    fontsize=10
+)
+
+ax.set_xlabel(
+    "Wild-type amino acid",
+    fontsize=12
+)
+
+# ---------------------------------------------------------
+# Y axis
+# ---------------------------------------------------------
+
+ax.set_yticks(
+    np.arange(len(heatmap_labels))
+)
+
+ax.set_yticklabels(
+    heatmap_labels,
+    fontsize=10
+)
+
+# ---------------------------------------------------------
+# Separate MPNN groups visually
+# ---------------------------------------------------------
+
+ax.axhline(
+    2.5,
+    color="white",
+    linewidth=2
+)
+
+ax.axhline(
+    5.5,
+    color="white",
+    linewidth=2
+)
+
+# ---------------------------------------------------------
+# Cell values
+# ---------------------------------------------------------
+
+for i in range(
+    heatmap.shape[0]
+):
+
+    for j in range(
+        heatmap.shape[1]
+    ):
+
+        value = heatmap[i, j]
+
+        # Choose text color based on background intensity.
+        if value > 2.2:
+            text_color = "white"
+        else:
+            text_color = "black"
+
+        ax.text(
+            j,
+            i,
+            "{:.2f}".format(value),
+            ha="center",
+            va="center",
+            fontsize=6,
+            color=text_color
+        )
+
+# ---------------------------------------------------------
+# Colorbar
+# ---------------------------------------------------------
+
+cbar = fig.colorbar(
+    im,
+    ax=ax,
+    pad=0.02
+)
+
+cbar.set_label(
+    "Shannon entropy (bits)",
+    rotation=270,
+    labelpad=20,
+    fontsize=11
+)
+
+# ---------------------------------------------------------
+# Title
+# ---------------------------------------------------------
+
+ax.set_title(
+    "Amino-Acid Substitution Entropy Across MPNN Models",
+    fontsize=13,
+    pad=12
+)
+
+plt.tight_layout()
+
+# =========================================================
+# SAVE FIGURE
+# =========================================================
+
+png_output = os.path.join(
+    OUTPUT_DIR,
+    "figure5_entropy_heatmap.png"
+)
+
+pdf_output = os.path.join(
+    OUTPUT_DIR,
+    "figure5_entropy_heatmap.pdf"
+)
+
+svg_output = os.path.join(
+    OUTPUT_DIR,
+    "figure5_entropy_heatmap.svg"
+)
+
+plt.savefig(
+    png_output,
+    dpi=600,
+    bbox_inches="tight"
+)
+
+plt.savefig(
+    pdf_output,
+    bbox_inches="tight"
+)
+
+plt.savefig(
+    svg_output,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+# =========================================================
+# FINISHED
+# =========================================================
+
+print()
+print("FINISHED")
+print("-" * 70)
+
+print(csv_output)
+print(png_output)
+print(pdf_output)
+print(svg_output)

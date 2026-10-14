@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+
+import csv
+import numpy as np
+import matplotlib.pyplot as plt
+
+INPUT = "figure2_per_pdb.csv"
+
+models = ["ProteinMPNN", "LigandMPNN", "SolubleMPNN"]
+buckets = ["helix_rich", "mixed", "sheet_rich"]
+
+positions = [1, 2, 3, 5, 6, 7, 9, 10, 11]
+
+labels = [
+    "Helix", "Mixed", "Sheet",
+    "Helix", "Mixed", "Sheet",
+    "Helix", "Mixed", "Sheet"
+]
+
+# ---------------------------------------------------------
+# Read data
+# ---------------------------------------------------------
+
+rows = []
+
+with open(INPUT, newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        rows.append(row)
+
+
+def get_groups(metric):
+
+    groups = []
+
+    for model in models:
+        for bucket in buckets:
+
+            values = []
+
+            for row in rows:
+
+                if row["model"] == model and row["bucket"] == bucket:
+
+                    try:
+                        value = float(row[metric])
+
+                        if np.isfinite(value):
+                            values.append(value)
+
+                    except (ValueError, TypeError):
+                        pass
+
+            groups.append(np.asarray(values))
+
+    return groups
+
+
+def make_violin(metric, ylabel, filename, panel, ylim=None):
+
+    groups = get_groups(metric)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # -----------------------------------------------------
+    # Violins
+    # -----------------------------------------------------
+
+    parts = ax.violinplot(
+        groups,
+        positions=positions,
+        widths=0.78,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+        bw_method="scott"
+    )
+
+    # Color by MPNN.
+    # Uses Matplotlib's default color cycle.
+    model_colors = [
+        plt.rcParams["axes.prop_cycle"].by_key()["color"][0],
+        plt.rcParams["axes.prop_cycle"].by_key()["color"][1],
+        plt.rcParams["axes.prop_cycle"].by_key()["color"][2]
+    ]
+
+    for i, body in enumerate(parts["bodies"]):
+
+        model_index = i // 3
+
+        body.set_facecolor(model_colors[model_index])
+        body.set_edgecolor("black")
+        body.set_linewidth(0.8)
+        body.set_alpha(0.55)
+
+    # -----------------------------------------------------
+    # Individual PDB observations
+    # -----------------------------------------------------
+
+    rng = np.random.RandomState(42)
+
+    for pos, values in zip(positions, groups):
+
+        jitter = rng.normal(
+            0,
+            0.055,
+            size=len(values)
+        )
+
+        ax.scatter(
+            np.full(len(values), pos) + jitter,
+            values,
+            s=5,
+            color="black",
+            alpha=0.15,
+            edgecolors="none",
+            zorder=2
+        )
+
+    # -----------------------------------------------------
+    # Median + IQR
+    # -----------------------------------------------------
+
+    for pos, values in zip(positions, groups):
+
+        q1 = np.percentile(values, 25)
+        median = np.percentile(values, 50)
+        q3 = np.percentile(values, 75)
+
+        # IQR
+        ax.vlines(
+            pos,
+            q1,
+            q3,
+            color="black",
+            linewidth=4,
+            zorder=5
+        )
+
+        # Median
+        ax.scatter(
+            pos,
+            median,
+            s=35,
+            facecolor="white",
+            edgecolor="black",
+            linewidth=0.8,
+            zorder=6
+        )
+
+    # -----------------------------------------------------
+    # Sample sizes
+    # -----------------------------------------------------
+
+    if ylim is not None:
+        ymin, ymax = ylim
+        n_y = ymin + (ymax - ymin) * 0.025
+    else:
+        current_min = min(np.min(x) for x in groups)
+        current_max = max(np.max(x) for x in groups)
+        n_y = current_min
+
+    for pos, values in zip(positions, groups):
+
+        ax.text(
+            pos,
+            n_y,
+            "n={}".format(len(values)),
+            ha="center",
+            va="bottom",
+            fontsize=7
+        )
+
+    # -----------------------------------------------------
+    # X axis
+    # -----------------------------------------------------
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(labels, fontsize=10)
+
+    transform = ax.get_xaxis_transform()
+
+    ax.text(
+        2, -0.13,
+        "ProteinMPNN",
+        ha="center",
+        va="top",
+        transform=transform,
+        fontsize=11,
+        fontweight="bold"
+    )
+
+    ax.text(
+        6, -0.13,
+        "LigandMPNN",
+        ha="center",
+        va="top",
+        transform=transform,
+        fontsize=11,
+        fontweight="bold"
+    )
+
+    ax.text(
+        10, -0.13,
+        "SolubleMPNN",
+        ha="center",
+        va="top",
+        transform=transform,
+        fontsize=11,
+        fontweight="bold"
+    )
+
+    # -----------------------------------------------------
+    # Y axis / appearance
+    # -----------------------------------------------------
+
+    ax.set_ylabel(ylabel, fontsize=12)
+
+    if ylim is not None:
+        ax.set_ylim(ylim)
+
+    ax.yaxis.grid(
+        True,
+        linestyle="--",
+        linewidth=0.5,
+        alpha=0.30
+    )
+
+    ax.xaxis.grid(False)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    # Panel letter
+    ax.text(
+        -0.055,
+        1.02,
+        panel,
+        transform=ax.transAxes,
+        fontsize=16,
+        fontweight="bold",
+        va="bottom"
+    )
+
+    plt.subplots_adjust(bottom=0.22)
+    plt.tight_layout()
+
+    # -----------------------------------------------------
+    # Save
+    # -----------------------------------------------------
+
+    plt.savefig(
+        filename + ".png",
+        dpi=600,
+        bbox_inches="tight"
+    )
+
+    plt.savefig(
+        filename + ".pdf",
+        bbox_inches="tight"
+    )
+
+    plt.savefig(
+        filename + ".svg",
+        bbox_inches="tight"
+    )
+
+    plt.close()
+
+    # -----------------------------------------------------
+    # Console statistics
+    # -----------------------------------------------------
+
+    print("\n" + panel + " -- " + ylabel)
+    print("-" * 75)
+
+    index = 0
+
+    for model in models:
+        for bucket in buckets:
+
+            values = groups[index]
+
+            print(
+                "{:<12s} {:<12s} n={:<4d} "
+                "mean={:.4f} median={:.4f} "
+                "Q1={:.4f} Q3={:.4f}".format(
+                    model,
+                    bucket,
+                    len(values),
+                    np.mean(values),
+                    np.median(values),
+                    np.percentile(values, 25),
+                    np.percentile(values, 75)
+                )
+            )
+
+            index += 1
+
+
+# =========================================================
+# FIGURE 2A
+# =========================================================
+
+make_violin(
+    metric="mean_similarity",
+    ylabel="Mean wild-type sequence identity per protein",
+    filename="figure2A_WT_identity",
+    panel="A",
+    ylim=(0, 0.8)
+)
+
+
+# =========================================================
+# FIGURE 2B
+# =========================================================
+
+make_violin(
+    metric="mean_confidence",
+    ylabel="Mean MPNN confidence per protein",
+    filename="figure2B_confidence",
+    panel="B",
+    ylim=(0, 0.8)
+)
+
+
+print("\nFinished.")

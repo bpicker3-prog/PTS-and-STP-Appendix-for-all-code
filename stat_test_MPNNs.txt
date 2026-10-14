@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+
+import csv
+import math
+from collections import defaultdict
+
+import numpy as np
+from scipy.stats import (
+    friedmanchisquare,
+    wilcoxon,
+    kruskal,
+    mannwhitneyu
+)
+
+INPUT = "figure2_per_pdb.csv"
+OUTPUT = "figure2_statistical_tests.csv"
+
+MODELS = [
+    "ProteinMPNN",
+    "LigandMPNN",
+    "SolubleMPNN"
+]
+
+BUCKETS = [
+    "helix_rich",
+    "mixed",
+    "sheet_rich"
+]
+
+METRICS = {
+    "mean_similarity": "WT sequence identity",
+    "mean_confidence": "Internal MPNN confidence"
+}
+
+
+# =========================================================
+# READ DATA
+# =========================================================
+
+data = []
+
+with open(INPUT, newline="") as f:
+
+    reader = csv.DictReader(f)
+
+    for row in reader:
+
+        record = {
+            "model": row["model"],
+            "bucket": row["bucket"],
+            "assembly": row["assembly"]
+        }
+
+        for metric in METRICS:
+
+            try:
+                record[metric] = float(row[metric])
+
+            except (ValueError, TypeError):
+                record[metric] = np.nan
+
+        data.append(record)
+
+
+# =========================================================
+# HOLM MULTIPLE-TEST CORRECTION
+# =========================================================
+
+def holm_correction(pvalues):
+
+    """
+    Holm step-down adjustment.
+    Returns adjusted p-values in original order.
+    """
+
+    m = len(pvalues)
+
+    order = sorted(
+        range(m),
+        key=lambda i: pvalues[i]
+    )
+
+    adjusted = [None] * m
+
+    running_max = 0.0
+
+    for rank, index in enumerate(order):
+
+        multiplier = m - rank
+
+        value = multiplier * pvalues[index]
+
+        value = min(value, 1.0)
+
+        # Holm adjusted p-values must be monotonic.
+        running_max = max(
+            running_max,
+            value
+        )
+
+        adjusted[index] = min(
+            running_max,
+            1.0
+        )
+
+    return adjusted
+
+
+# =========================================================
+# EFFECT SIZE FOR PAIRED WILCOXON
+#
+# Rank-biserial correlation:
+#
+# positive = first model tends to be higher
+# negative = second model tends to be higher
+# =========================================================
+
+def paired_rank_biserial(x, y):
+
+    differences = np.asarray(x) - np.asarray(y)
+
+    differences = differences[
+        differences != 0
+    ]
+
+    n = len(differences)
+
+    if n == 0:
+        return np.nan
+
+    abs_diff = np.abs(differences)
+
+    order = np.argsort(abs_diff)
+
+    ranks = np.empty(n, dtype=float)
+
+    # Assign average ranks for ties.
+    sorted_values = abs_diff[order]
+
+    start = 0
+
+    while start < n:
+
+        end = start + 1
+
+        while (
+            end < n and
+            sorted_values[end] == sorted_values[start]
+        ):
+            end += 1
+
+        average_rank = (
+            (start + 1) + end
+        ) / 2.0
+
+        ranks[
+            order[start:end]
+        ] = average_rank
+
+        start = end
+
+    positive = np.sum(
+        ranks[differences > 0]
+    )
+
+    negative = np.sum(
+        ranks[differences < 0]
+    )
+
+    denominator = positive + negative
+
+    if denominator == 0:
+        return np.nan
+
+    return (
+        positive - negative
+    ) / denominator
+
+
+# =========================================================
+# EFFECT SIZE FOR MANN-WHITNEY
+#
+# Rank-biserial correlation.
+#
+# positive = first group tends to be higher
+# negative = second group tends to be higher
+# =========================================================
+
+def independent_rank_biserial(U, n1, n2):
+
+    return (
+        (2.0 * U) / (n1 * n2)
+    ) - 1.0
+
+
+# =========================================================
+# STORAGE
+# =========================================================
+
+results = []
+
+
+def add_result(
+    metric,
+    question,
+    test,
+    comparison,
+    bucket,
+    n,
+    statistic,
+    p_raw,
+    p_adjusted="",
+    effect_size="",
+    median_difference=""
+):
+
+    results.append({
+        "metric": metric,
+        "question": question,
+        "test": test,
+        "comparison": comparison,
+        "structure": bucket,
+        "n": n,
+        "statistic": statistic,
+        "p_raw": p_raw,
+        "p_adjusted": p_adjusted,
+        "effect_size": effect_size,
+        "median_difference": median_difference
+    })
+
+
+# =========================================================
+# ANALYSIS 1:
+# MODEL EFFECT WITHIN EACH STRUCTURAL CLASS
+# =========================================================
+
+print()
+print("=" * 80)
+print("MODEL COMPARISONS")
+print("=" * 80)
+
+for metric, metric_name in METRICS.items():
+
+    print()
+    print(metric_name)
+    print("-" * 80)
+
+    for bucket in BUCKETS:
+
+        # assembly -> model -> value
+        matched = defaultdict(dict)
+
+        for row in data:
+
+            if row["bucket"] != bucket:
+                continue
+
+            if not np.isfinite(row[metric]):
+                continue
+
+            matched[row["assembly"]][
+                row["model"]
+            ] = row[metric]
+
+        # Keep only proteins available for ALL THREE models.
+        complete = {
+            assembly: values
+            for assembly, values in matched.items()
+            if all(
+                model in values
+                for model in MODELS
+            )
+        }
+
+        arrays = []
+
+        for model in MODELS:
+
+            arrays.append(
+                np.asarray([
+                    complete[assembly][model]
+                    for assembly in sorted(complete)
+                ])
+            )
+
+        n = len(complete)
+
+        if n == 0:
+            continue
+
+        # ---------------------------------------------
+        # Overall Friedman test
+        # ---------------------------------------------
+
+        stat, p = friedmanchisquare(
+            arrays[0],
+            arrays[1],
+            arrays[2]
+        )
+
+        print()
+        print(
+            "{}: Friedman n={} chi2={:.4f} p={:.6g}".format(
+                bucket,
+                n,
+                stat,
+                p
+            )
+        )
+
+        add_result(
+            metric_name,
+            "Model effect",
+            "Friedman",
+            "ProteinMPNN vs LigandMPNN vs SolubleMPNN",
+            bucket,
+            n,
+            stat,
+            p
+        )
+
+        # ---------------------------------------------
+        # Pairwise Wilcoxon
+        # ---------------------------------------------
+
+        pairs = [
+            (0, 1),
+            (0, 2),
+            (1, 2)
+        ]
+
+        pair_results = []
+
+        for i, j in pairs:
+
+            x = arrays[i]
+            y = arrays[j]
+
+            stat_w, p_w = wilcoxon(
+                x,
+                y,
+                zero_method="wilcox",
+                alternative="two-sided"
+            )
+
+            effect = paired_rank_biserial(
+                x,
+                y
+            )
+
+            median_diff = np.median(
+                x - y
+            )
+
+            pair_results.append({
+                "i": i,
+                "j": j,
+                "stat": stat_w,
+                "p": p_w,
+                "effect": effect,
+                "median_diff": median_diff
+            })
+
+        adjusted = holm_correction(
+            [x["p"] for x in pair_results]
+        )
+
+        for result, p_adj in zip(
+            pair_results,
+            adjusted
+        ):
+
+            model1 = MODELS[result["i"]]
+            model2 = MODELS[result["j"]]
+
+            print(
+                "  {} vs {}: "
+                "W={:.3f}, raw p={:.6g}, "
+                "Holm p={:.6g}, "
+                "median delta={:.4f}, "
+                "rank-biserial={:.4f}".format(
+                    model1,
+                    model2,
+                    result["stat"],
+                    result["p"],
+                    p_adj,
+                    result["median_diff"],
+                    result["effect"]
+                )
+            )
+
+            add_result(
+                metric_name,
+                "Model effect",
+                "Wilcoxon signed-rank",
+                "{} vs {}".format(
+                    model1,
+                    model2
+                ),
+                bucket,
+                n,
+                result["stat"],
+                result["p"],
+                p_adj,
+                result["effect"],
+                result["median_diff"]
+            )
+
+
+# =========================================================
+# ANALYSIS 2:
+# STRUCTURAL CLASS EFFECT WITHIN EACH MODEL
+# =========================================================
+
+print()
+print()
+print("=" * 80)
+print("STRUCTURAL-CLASS COMPARISONS")
+print("=" * 80)
+
+for metric, metric_name in METRICS.items():
+
+    print()
+    print(metric_name)
+    print("-" * 80)
+
+    for model in MODELS:
+
+        groups = {}
+
+        for bucket in BUCKETS:
+
+            values = [
+                row[metric]
+                for row in data
+                if (
+                    row["model"] == model
+                    and row["bucket"] == bucket
+                    and np.isfinite(row[metric])
+                )
+            ]
+
+            groups[bucket] = np.asarray(
+                values
+            )
+
+        # ---------------------------------------------
+        # Overall Kruskal-Wallis
+        # ---------------------------------------------
+
+        stat, p = kruskal(
+            groups["helix_rich"],
+            groups["mixed"],
+            groups["sheet_rich"]
+        )
+
+        n_total = sum(
+            len(groups[x])
+            for x in BUCKETS
+        )
+
+        print()
+        print(
+            "{}: Kruskal-Wallis n={} "
+            "H={:.4f} p={:.6g}".format(
+                model,
+                n_total,
+                stat,
+                p
+            )
+        )
+
+        add_result(
+            metric_name,
+            "Structural-class effect",
+            "Kruskal-Wallis",
+            "Helix vs Mixed vs Sheet",
+            model,
+            n_total,
+            stat,
+            p
+        )
+
+        # ---------------------------------------------
+        # Pairwise Mann-Whitney U
+        # ---------------------------------------------
+
+        pairs = [
+            ("helix_rich", "mixed"),
+            ("helix_rich", "sheet_rich"),
+            ("mixed", "sheet_rich")
+        ]
+
+        pair_results = []
+
+        for bucket1, bucket2 in pairs:
+
+            x = groups[bucket1]
+            y = groups[bucket2]
+
+            U, p_u = mannwhitneyu(
+                x,
+                y,
+                alternative="two-sided"
+            )
+
+            effect = independent_rank_biserial(
+                U,
+                len(x),
+                len(y)
+            )
+
+            median_diff = (
+                np.median(x)
+                -
+                np.median(y)
+            )
+
+            pair_results.append({
+                "bucket1": bucket1,
+                "bucket2": bucket2,
+                "U": U,
+                "p": p_u,
+                "effect": effect,
+                "median_diff": median_diff,
+                "n1": len(x),
+                "n2": len(y)
+            })
+
+        adjusted = holm_correction(
+            [x["p"] for x in pair_results]
+        )
+
+        for result, p_adj in zip(
+            pair_results,
+            adjusted
+        ):
+
+            comparison = "{} vs {}".format(
+                result["bucket1"],
+                result["bucket2"]
+            )
+
+            print(
+                "  {}: U={:.3f}, "
+                "raw p={:.6g}, "
+                "Holm p={:.6g}, "
+                "median delta={:.4f}, "
+                "rank-biserial={:.4f}".format(
+                    comparison,
+                    result["U"],
+                    result["p"],
+                    p_adj,
+                    result["median_diff"],
+                    result["effect"]
+                )
+            )
+
+            add_result(
+                metric_name,
+                "Structural-class effect",
+                "Mann-Whitney U",
+                comparison,
+                model,
+                "{} + {}".format(
+                    result["n1"],
+                    result["n2"]
+                ),
+                result["U"],
+                result["p"],
+                p_adj,
+                result["effect"],
+                result["median_diff"]
+            )
+
+
+# =========================================================
+# WRITE RESULTS
+# =========================================================
+
+fieldnames = [
+    "metric",
+    "question",
+    "test",
+    "comparison",
+    "structure",
+    "n",
+    "statistic",
+    "p_raw",
+    "p_adjusted",
+    "effect_size",
+    "median_difference"
+]
+
+with open(
+    OUTPUT,
+    "w",
+    newline=""
+) as f:
+
+    writer = csv.DictWriter(
+        f,
+        fieldnames=fieldnames
+    )
+
+    writer.writeheader()
+    writer.writerows(results)
+
+print()
+print("=" * 80)
+print("FINISHED")
+print("=" * 80)
+print("Results written to:", OUTPUT)

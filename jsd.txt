@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+
+import csv
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =========================================================
+# PATHS
+# =========================================================
+
+BASE_DIR = os.path.expanduser(
+    "~/bucket_lists/mutation_profiles_summary"
+)
+
+OUTPUT_DIR = os.path.expanduser(
+    "~/bucket_lists"
+)
+
+# =========================================================
+# CONDITIONS
+# =========================================================
+
+STRUCTURES = [
+    "helix_rich",
+    "mixed",
+    "sheet_rich"
+]
+
+STRUCTURE_NAMES = {
+    "helix_rich": "Helix",
+    "mixed": "Mixed",
+    "sheet_rich": "Sheet"
+}
+
+MODEL_NAMES = {
+    "protein": "ProteinMPNN",
+    "ligand": "LigandMPNN",
+    "soluble": "SolubleMPNN"
+}
+
+COMPARISONS = [
+    ("protein", "ligand"),
+    ("protein", "soluble"),
+    ("ligand", "soluble")
+]
+
+# =========================================================
+# READ TRANSITION MATRIX
+# =========================================================
+
+def read_matrix(filename):
+
+    with open(filename, newline="") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+
+    if len(rows) < 2:
+        raise ValueError(
+            "File appears empty: {}".format(filename)
+        )
+
+    column_labels = [
+        x.strip() for x in rows[0][1:]
+    ]
+
+    row_labels = []
+    matrix = []
+
+    for row in rows[1:]:
+
+        if not row:
+            continue
+
+        row_labels.append(
+            row[0].strip()
+        )
+
+        values = []
+
+        for value in row[1:]:
+
+            value = value.strip()
+
+            if value == "":
+                values.append(0.0)
+            else:
+                try:
+                    values.append(float(value))
+                except ValueError:
+                    values.append(0.0)
+
+        matrix.append(values)
+
+    return (
+        row_labels,
+        column_labels,
+        np.asarray(matrix, dtype=float)
+    )
+
+# =========================================================
+# KL DIVERGENCE
+# =========================================================
+
+def kl_divergence(p, q):
+
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+
+    mask = p > 0
+
+    return np.sum(
+        p[mask] *
+        np.log2(
+            p[mask] / q[mask]
+        )
+    )
+
+# =========================================================
+# JENSEN-SHANNON DIVERGENCE
+# =========================================================
+
+def js_divergence(p, q):
+
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+
+    # Normalize both distributions.
+    if np.sum(p) == 0 or np.sum(q) == 0:
+        return np.nan
+
+    p = p / np.sum(p)
+    q = q / np.sum(q)
+
+    m = 0.5 * (p + q)
+
+    return 0.5 * (
+        kl_divergence(p, m)
+        +
+        kl_divergence(q, m)
+    )
+
+# =========================================================
+# LOAD ALL NINE MATRICES
+# =========================================================
+
+matrices = {}
+aa_order = None
+
+print()
+print("READING TRANSITION MATRICES")
+print("-" * 70)
+
+for structure in STRUCTURES:
+
+    for model in MODEL_NAMES:
+
+        filename = os.path.join(
+            BASE_DIR,
+            structure,
+            model,
+            "aa_transition_matrix_row_norm.csv"
+        )
+
+        print(
+            "{:<12s} {:<8s} {}".format(
+                MODEL_NAMES[model],
+                STRUCTURE_NAMES[structure],
+                filename
+            )
+        )
+
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(
+                "Could not find:\n{}".format(filename)
+            )
+
+        row_labels, column_labels, matrix = read_matrix(
+            filename
+        )
+
+        if matrix.shape != (20, 20):
+            raise ValueError(
+                "{} has shape {}; expected (20, 20)".format(
+                    filename,
+                    matrix.shape
+                )
+            )
+
+        if aa_order is None:
+            aa_order = row_labels
+
+        elif row_labels != aa_order:
+            raise ValueError(
+                "Amino-acid row order differs in:\n{}".format(
+                    filename
+                )
+            )
+
+        matrices[(structure, model)] = matrix
+
+# =========================================================
+# CALCULATE JSD
+# =========================================================
+
+heatmap_rows = []
+heatmap_labels = []
+results = []
+
+print()
+print("CALCULATING JENSEN-SHANNON DIVERGENCE")
+print("-" * 70)
+
+# Comparison first, then structural class.
+#
+# Protein vs Ligand:
+#   Helix
+#   Mixed
+#   Sheet
+#
+# Protein vs Soluble:
+#   Helix
+#   Mixed
+#   Sheet
+#
+# Ligand vs Soluble:
+#   Helix
+#   Mixed
+#   Sheet
+
+for model1, model2 in COMPARISONS:
+
+    comparison_name = "{} vs {}".format(
+        MODEL_NAMES[model1],
+        MODEL_NAMES[model2]
+    )
+
+    for structure in STRUCTURES:
+
+        matrix1 = matrices[
+            (structure, model1)
+        ]
+
+        matrix2 = matrices[
+            (structure, model2)
+        ]
+
+        jsd_values = []
+
+        for i, amino_acid in enumerate(aa_order):
+
+            jsd = js_divergence(
+                matrix1[i],
+                matrix2[i]
+            )
+
+            jsd_values.append(jsd)
+
+            results.append({
+                "comparison": comparison_name,
+                "structure": STRUCTURE_NAMES[structure],
+                "amino_acid": amino_acid,
+                "jsd_bits": jsd
+            })
+
+        heatmap_rows.append(
+            jsd_values
+        )
+
+        heatmap_labels.append(
+            "{} - {}".format(
+                comparison_name,
+                STRUCTURE_NAMES[structure]
+            )
+        )
+
+heatmap = np.asarray(
+    heatmap_rows,
+    dtype=float
+)
+
+# =========================================================
+# EXPORT ALL JSD VALUES
+# =========================================================
+
+csv_output = os.path.join(
+    OUTPUT_DIR,
+    "figure6_jsd_values.csv"
+)
+
+with open(csv_output, "w", newline="") as f:
+
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "comparison",
+            "structure",
+            "amino_acid",
+            "jsd_bits"
+        ]
+    )
+
+    writer.writeheader()
+
+    for result in results:
+        writer.writerow(result)
+
+# =========================================================
+# PRINT SUMMARY
+# =========================================================
+
+print()
+print("MEAN JSD BY CONDITION")
+print("-" * 80)
+
+for label, values in zip(
+    heatmap_labels,
+    heatmap
+):
+
+    print(
+        "{:<50s} mean={:.4f} bits".format(
+            label,
+            np.nanmean(values)
+        )
+    )
+
+print()
+print("JSD RANGE")
+print("-" * 80)
+
+print(
+    "Minimum observed JSD: {:.4f} bits".format(
+        np.nanmin(heatmap)
+    )
+)
+
+print(
+    "Maximum observed JSD: {:.4f} bits".format(
+        np.nanmax(heatmap)
+    )
+)
+
+# =========================================================
+# IDENTIFY LARGEST MODEL DIFFERENCES
+# =========================================================
+
+print()
+print("TOP 15 LARGEST JSD VALUES")
+print("-" * 80)
+
+sorted_results = sorted(
+    results,
+    key=lambda x: x["jsd_bits"],
+    reverse=True
+)
+
+for result in sorted_results[:15]:
+
+    print(
+        "{:<31s} {:<6s} AA={} JSD={:.4f}".format(
+            result["comparison"],
+            result["structure"],
+            result["amino_acid"],
+            result["jsd_bits"]
+        )
+    )
+
+# =========================================================
+# FIGURE
+# =========================================================
+
+fig, ax = plt.subplots(
+    figsize=(13, 6)
+)
+
+im = ax.imshow(
+    heatmap,
+    aspect="auto",
+    interpolation="nearest",
+    vmin=0,
+    vmax=1
+)
+
+# ---------------------------------------------------------
+# X axis
+# ---------------------------------------------------------
+
+ax.set_xticks(
+    np.arange(len(aa_order))
+)
+
+ax.set_xticklabels(
+    aa_order,
+    fontsize=10
+)
+
+ax.set_xlabel(
+    "Wild-type amino acid",
+    fontsize=12
+)
+
+# ---------------------------------------------------------
+# Y axis
+# ---------------------------------------------------------
+
+ax.set_yticks(
+    np.arange(len(heatmap_labels))
+)
+
+ax.set_yticklabels(
+    heatmap_labels,
+    fontsize=9
+)
+
+# Separate pairwise comparisons.
+ax.axhline(
+    2.5,
+    color="white",
+    linewidth=2
+)
+
+ax.axhline(
+    5.5,
+    color="white",
+    linewidth=2
+)
+
+# ---------------------------------------------------------
+# Numerical values
+# ---------------------------------------------------------
+
+for i in range(
+    heatmap.shape[0]
+):
+
+    for j in range(
+        heatmap.shape[1]
+    ):
+
+        value = heatmap[i, j]
+
+        if value > 0.45:
+            text_color = "white"
+        else:
+            text_color = "black"
+
+        ax.text(
+            j,
+            i,
+            "{:.2f}".format(value),
+            ha="center",
+            va="center",
+            fontsize=6,
+            color=text_color
+        )
+
+# ---------------------------------------------------------
+# Colorbar
+# ---------------------------------------------------------
+
+cbar = fig.colorbar(
+    im,
+    ax=ax,
+    pad=0.02
+)
+
+cbar.set_label(
+    "Jensen-Shannon divergence (bits)",
+    rotation=270,
+    labelpad=22,
+    fontsize=11
+)
+
+# ---------------------------------------------------------
+# Title
+# ---------------------------------------------------------
+
+ax.set_title(
+    "Pairwise Divergence of Amino-Acid Substitution Profiles",
+    fontsize=13,
+    pad=12
+)
+
+plt.tight_layout()
+
+# =========================================================
+# SAVE
+# =========================================================
+
+png_output = os.path.join(
+    OUTPUT_DIR,
+    "figure6_jsd_heatmap.png"
+)
+
+pdf_output = os.path.join(
+    OUTPUT_DIR,
+    "figure6_jsd_heatmap.pdf"
+)
+
+svg_output = os.path.join(
+    OUTPUT_DIR,
+    "figure6_jsd_heatmap.svg"
+)
+
+plt.savefig(
+    png_output,
+    dpi=600,
+    bbox_inches="tight"
+)
+
+plt.savefig(
+    pdf_output,
+    bbox_inches="tight"
+)
+
+plt.savefig(
+    svg_output,
+    bbox_inches="tight"
+)
+
+plt.close()
+
+print()
+print("FINISHED")
+print("-" * 70)
+print(csv_output)
+print(png_output)
+print(pdf_output)
+print(svg_output)
