@@ -1,6 +1,7 @@
 # PTS and STP Appendix for AI-Based Protein Design Benchmarking
 
 This repository contains the computational scripts used for the thesis:
+Skip to PTS Independent for the code in the JCIM paper.
 
 **A Critical Evaluation of Current AI-Based Protein Design Methodologies**
 
@@ -72,6 +73,7 @@ For the reported secondary-structure analysis, proteins were separated into:
 * mixed
 
 The original development scripts may contain additional exploratory buckets, including protein-length and loop-rich categories. These exploratory categories were not included in the final comparative results reported in the thesis.
+The jsd, stat test, figures are from the smaller scoped paper. The rest are from the main thesis.
 
 ### Amino Acid and Residue-Class Analysis
 
