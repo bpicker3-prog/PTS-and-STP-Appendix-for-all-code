@@ -203,6 +203,7 @@ ANALYSIS_PYTHON_BIN="${ANALYSIS_PYTHON_BIN:-python3}"
 MPNN_PYTHON_BIN="${MPNN_PYTHON_BIN:-python3}"
 INPUTS=()
 LIST_FILE=""
+PREPARED_LIST=""
 
 usage() {
 cat <<'EOF'
@@ -214,6 +215,7 @@ Usage:
 Options:
   -p, --pdb FILE_OR_ID       PDB file/mmCIF file or 4-character PDB ID; repeatable
   -l, --list FILE            Text file with one PDB path/ID per line
+      --prepared-list FILE    Internal: prevalidated ref_clean.pdb paths
   -n, --num-seqs N           Designs per model (default: 200)
   -t, --temp FLOAT           Sampling temperature (default: 0.1)
       --seed N               MPNN random seed (default: 42)
@@ -235,6 +237,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -p|--pdb) INPUTS+=("${2:?missing value for $1}"); shift 2 ;;
     -l|--list) LIST_FILE="${2:?missing value for $1}"; shift 2 ;;
+    --prepared-list) PREPARED_LIST="${2:?missing value for $1}"; shift 2 ;;
     -n|--num-seqs) NUM_SEQS="${2:?missing value for $1}"; shift 2 ;;
     -t|--temp) TEMPERATURE="${2:?missing value for $1}"; shift 2 ;;
     --seed) RANDOM_SEED="${2:?missing value for $1}"; shift 2 ;;
@@ -249,7 +252,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 MODELS="${MODELS//,/ }"
-if [[ -n "$LIST_FILE" ]]; then
+if [[ -n "$PREPARED_LIST" ]]; then
+  [[ -f "$PREPARED_LIST" ]] || { echo "ERROR: prepared list not found: $PREPARED_LIST" >&2; exit 2; }
+  while IFS= read -r x; do [[ -n "$x" ]] && INPUTS+=("$x"); done < "$PREPARED_LIST"
+elif [[ -n "$LIST_FILE" ]]; then
   [[ -f "$LIST_FILE" ]] || { echo "ERROR: list not found: $LIST_FILE" >&2; exit 2; }
   while IFS= read -r x; do
     x="${x%%#*}"; x="$(printf '%s' "$x" | xargs)"
@@ -376,6 +382,11 @@ make_reference() {
   local pdb="$1" outdir="$2"
   mkdir -p "$outdir/seqs"
   cp -f "$pdb" "$outdir/input.pdb"
+  if [[ "$pdb" == */ref_clean.pdb && -f "$(dirname "$pdb")/wt.fasta" ]]; then
+    cp -f "$pdb" "$outdir/ref_clean.pdb"
+    cp -f "$(dirname "$pdb")/wt.fasta" "$outdir/seqs/seq_0000_wt.fasta"
+    return 0
+  fi
   "$ANALYSIS_PYTHON_BIN" - "$pdb" "$outdir/ref_clean.pdb" "$outdir/seqs/seq_0000_wt.fasta" <<'PY'
 import sys
 from Bio.PDB import PDBParser, PDBIO
@@ -553,31 +564,28 @@ print(f'[summary] {len({r["protein"] for r in rows})} proteins summarized; {len(
 PY
 
 printf 'input\tprepared_pdb\tprotein\n' > "$OUT_BASE/summary/input_manifest.tsv"
+RETRY_QUEUE="$OUT_BASE/summary/retry_queue.tsv"
+printf 'input\tprepared_pdb\tprotein\tmodel_type\ttag\tfirst_exit\n' > "$RETRY_QUEUE"
 idx=0
 for input in "${INPUTS[@]}"; do
   idx=$((idx+1))
-  prep_tmp="$OUT_BASE/summary/.prepare_${idx}.log"
-  if ! prepare_pdb "$input" "$idx" >"$prep_tmp" 2>&1; then
-    detail="$(tr '\n\t' '  ' < "$prep_tmp" | sed 's/[[:space:]]\+/ /g')"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "" "prepare" "" "preparation_failed" "$detail" >> "$FAIL_LOG"
-    echo "[WARNING] skipping $input: preparation failed" >&2
-    rm -f "$prep_tmp"
-    continue
+  if [[ -n "$PREPARED_LIST" ]]; then
+    prepared="$input"
+    protein="$(basename "$(dirname "$prepared")")"
+    [[ -f "$prepared" ]] || { echo "[WARNING] prepared input missing: $prepared" >&2; continue; }
+    printf '%s\t%s\t%s\n' "$input" "$prepared" "$protein" >> "$OUT_BASE/summary/input_manifest.tsv"
+  else
+    prep_tmp="$OUT_BASE/summary/.prepare_${idx}.log"
+    if ! prepare_pdb "$input" "$idx" >"$prep_tmp" 2>&1; then
+      detail="$(tr '\n\t' '  ' < "$prep_tmp" | sed 's/[[:space:]]\+/ /g')"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "" "prepare" "" "preparation_failed" "$detail" >> "$FAIL_LOG"
+      echo "[WARNING] skipping $input: preparation failed" >&2
+      rm -f "$prep_tmp"; continue
+    fi
+    prepared="$(tail -n 1 "$prep_tmp")"; rm -f "$prep_tmp"
+    protein="$(basename "$prepared" .pdb)"
+    printf '%s\t%s\t%s\n' "$input" "$prepared" "$protein" >> "$OUT_BASE/summary/input_manifest.tsv"
   fi
-  prepared="$(tail -n 1 "$prep_tmp")"
-  rm -f "$prep_tmp"
-  protein="$(basename "$prepared" .pdb)"
-  printf '%s\t%s\t%s\n' "$input" "$prepared" "$protein" >> "$OUT_BASE/summary/input_manifest.tsv"
-
-  validation="$OUT_BASE/summary/.validate_${idx}.log"
-  if ! validate_backbone "$prepared" >"$validation" 2>&1; then
-    detail="$(tr '\n\t' '; ' < "$validation" | sed 's/[[:space:]]\+/ /g')"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "$protein" "validation" "" "incomplete_backbone" "$detail" >> "$FAIL_LOG"
-    echo "[WARNING] skipping $protein: incomplete N/CA/C/O backbone ($detail)" >&2
-    rm -f "$validation"
-    continue
-  fi
-  rm -f "$validation"
 
   completed=0
   for m in $MODELS; do
@@ -588,30 +596,50 @@ for input in "${INPUTS[@]}"; do
     run_model "$prepared" "$protein" "$model_type" "$tag" > >(tee "$model_log") 2>&1
     rc=$?
     set -e
-    if [[ $rc -eq 0 ]]; then
-      completed=$((completed+1))
-      rm -f "$model_log"
+    if [[ $rc -eq 0 ]]; then completed=$((completed+1)); rm -f "$model_log"
     else
-      detail="$(tail -n 20 "$model_log" | tr '\n\t' '  ' | sed 's/[[:space:]]\+/ /g')"
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "$protein" "model" "$tag" "model_failed_exit_${rc}" "$detail" >> "$FAIL_LOG"
-      echo "[WARNING] $protein/$tag failed (exit $rc); continuing benchmark" >&2
+      echo "[WARNING] $protein/$tag failed (exit $rc); queued for one retry after the main pass" >&2
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "$prepared" "$protein" "$model_type" "$tag" "$rc" >> "$RETRY_QUEUE"
       rm -f "$model_log"
     fi
   done
-
   if (( completed > 0 )); then
-    set +e
-    "$ANALYSIS_PYTHON_BIN" "$PROFILE_PY" "$OUT_BASE/runs" "$protein" "$OUT_BASE/profiles/$protein"
-    prc=$?
-    set -e
+    set +e; "$ANALYSIS_PYTHON_BIN" "$PROFILE_PY" "$OUT_BASE/runs" "$protein" "$OUT_BASE/profiles/$protein"; prc=$?; set -e
     if [[ $prc -ne 0 ]]; then
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "$protein" "profile" "" "profile_failed" "profile generation exit $prc" >> "$FAIL_LOG"
       echo "[WARNING] profile generation failed for $protein; continuing" >&2
     fi
-  else
-    echo "[WARNING] no models completed for $protein; no profile generated" >&2
+  else echo "[WARNING] no models completed for $protein; no profile generated" >&2
   fi
 done
+
+# Retry failed model jobs once after every primary job has been attempted.
+if [[ $(wc -l < "$RETRY_QUEUE") -gt 1 ]]; then
+  echo
+  echo "[RETRY] Retrying failed model jobs once..."
+  tail -n +2 "$RETRY_QUEUE" | while IFS=$'\t' read -r input prepared protein model_type tag first_exit; do
+    echo "[RETRY] $protein/$tag (first exit $first_exit)"
+    retry_log="$OUT_BASE/summary/.retry_${protein}_${tag}.log"
+    set +e
+    run_model "$prepared" "$protein" "$model_type" "$tag" > >(tee "$retry_log") 2>&1
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+      echo "[RECOVERED] $protein/$tag succeeded on retry"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "$protein" "retry" "$tag" "recovered_on_retry" "first_exit=$first_exit" >> "$OUT_BASE/summary/recovered_jobs.tsv"
+      rm -f "$retry_log"
+    else
+      detail="$(tail -n 20 "$retry_log" | tr '\n\t' '  ' | sed 's/[[:space:]]\+/ /g')"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$input" "$protein" "model_retry" "$tag" "model_failed_after_retry_exit_${rc}" "$detail" >> "$FAIL_LOG"
+      echo "[WARNING] $protein/$tag failed again (exit $rc); recorded as final model failure" >&2
+      rm -f "$retry_log"
+    fi
+    # Regenerate this protein's profile so recovered model outputs are included.
+    set +e
+    "$ANALYSIS_PYTHON_BIN" "$PROFILE_PY" "$OUT_BASE/runs" "$protein" "$OUT_BASE/profiles/$protein" >/dev/null 2>&1
+    set -e
+  done
+fi
 
 "$ANALYSIS_PYTHON_BIN" "$SUMMARY_PY" "$OUT_BASE/runs" "$OUT_BASE/summary"
 rm -f "$PROFILE_PY" "$SUMMARY_PY"
@@ -622,20 +650,106 @@ echo "Results: $OUT_BASE"
 echo "  Mutation maps: $OUT_BASE/profiles/<protein>/<model>/"
 echo "  Per-protein metrics: $OUT_BASE/summary/per_protein_summary.csv"
 echo "  Statistical tests: $OUT_BASE/summary/statistical_tests.csv"
-echo "  Failed/skipped inputs: $FAIL_LOG"
+echo "  Final failures: $FAIL_LOG"
+echo "  Retry queue: $RETRY_QUEUE"
+echo "  Recovered jobs: $OUT_BASE/summary/recovered_jobs.tsv"
 
 __MPNN_ENGINE__
 chmod +x "$ENGINE"
-mkdir -p "$OUT_BASE/replicates" "$OUT_BASE/summary"
+mkdir -p "$OUT_BASE/replicates" "$OUT_BASE/summary" "$OUT_BASE/prepared_inputs"
 OUT_BASE="$(cd "$OUT_BASE" && pwd)"
 printf 'run\tseed\ttemperature\tn_sequences\tmodels\tresult_directory\n' > "$OUT_BASE/summary/run_metadata.tsv"
+printf 'input\tprotein\tstage\tmodel\treason\tdetail\n' > "$OUT_BASE/summary/failed_inputs.tsv"
+PREPARED_LIST="$OUT_BASE/summary/prepared_inputs.txt"
+: > "$PREPARED_LIST"
+printf 'input\tstatus\tdetail\n' > "$OUT_BASE/summary/input_qc.tsv"
+
+info "Preparing and validating input structures once for all replicates..."
+# Use a one-time preparation pass through the engine with no model execution is avoided by
+# a dedicated Python preparer below. Local files are preferred; 4-character IDs use the shared cache.
+"$ANALYSIS_PYTHON_BIN" - "$OUT_BASE" "$RUNTIME_DIR" "${INPUT_ARGS[@]}" <<'PYPREP'
+import sys,os,re,gzip,shutil,subprocess
+from pathlib import Path
+from Bio.PDB import PDBParser,MMCIFParser,PDBIO,Select
+root=Path(sys.argv[1]); runtime=Path(sys.argv[2]); args=sys.argv[3:]
+inputs=[]; i=0
+while i<len(args):
+    if args[i]=='--pdb': inputs.append(args[i+1]); i+=2
+    elif args[i]=='--list':
+        for line in open(args[i+1]):
+            x=line.split('#',1)[0].strip()
+            if x: inputs.append(x)
+        i+=2
+    else: i+=1
+cache=runtime/'pdb_cache'; cache.mkdir(parents=True,exist_ok=True)
+prepared=root/'prepared_inputs'; prepared.mkdir(exist_ok=True)
+fail=open(root/'summary'/'failed_inputs.tsv','a')
+plist=open(root/'summary'/'prepared_inputs.txt','w')
+manifest=open(root/'summary'/'input_manifest.tsv','w'); manifest.write('input\tprepared_pdb\tprotein\n')
+std={'ALA','ARG','ASN','ASP','CYS','GLN','GLU','GLY','HIS','ILE','LEU','LYS','MET','PHE','PRO','SER','THR','TRP','TYR','VAL'}
+aa={'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C','GLN':'Q','GLU':'E','GLY':'G','HIS':'H','ILE':'I','LEU':'L','LYS':'K','MET':'M','PHE':'F','PRO':'P','SER':'S','THR':'T','TRP':'W','TYR':'Y','VAL':'V'}
+required={'N','CA','C','O'}
+def log(inp,protein,reason,detail):
+    fail.write(f'{inp}\t{protein}\tpreparation\t\t{reason}\t{detail}\n'); fail.flush(); print(f'[WARNING] skipping {inp}: {reason} ({detail})',file=sys.stderr)
+for n,inp in enumerate(inputs,1):
+    try:
+        src=Path(inp)
+        if src.is_file(): raw=src.resolve(); stem=src.stem
+        elif re.fullmatch(r'[0-9A-Za-z]{4}',inp):
+            pid=inp.upper(); lower=inp.lower(); gz=cache/f'{lower}_assembly1.cif.gz'; cif=cache/f'{lower}_assembly1.cif'
+            if not cif.exists():
+                if not gz.exists():
+                    url=f'https://files.wwpdb.org/download/{pid}-assembly1.cif.gz'; tmp=Path(str(gz)+'.tmp')
+                    print(f'[download] {pid} biological assembly 1')
+                    cmd=['timeout','--signal=TERM','--kill-after=10s','150s','curl','-fsSL','--connect-timeout','20','--max-time','120','-o',str(tmp),url]
+                    r=subprocess.run(cmd)
+                    if r.returncode!=0 or not tmp.exists(): raise RuntimeError(f'download_failed_exit_{r.returncode}')
+                    tmp.replace(gz)
+                with gzip.open(gz,'rb') as fi, open(cif,'wb') as fo: shutil.copyfileobj(fi,fo)
+            raw=cif; stem=f'{lower}_assembly1'
+        else: raise RuntimeError('not_a_local_file_or_4_character_PDB_ID')
+        parser=MMCIFParser(QUIET=True) if raw.suffix.lower() in ('.cif','.mmcif') else PDBParser(QUIET=True)
+        s=parser.get_structure('input',str(raw)); model=next(s.get_models())
+        counts={c.id:sum(1 for r in c if r.resname.strip() in std) for c in model}
+        if not counts: raise RuntimeError('no_standard_protein_residues')
+        best=max(counts,key=counts.get); chain=next(c for c in model if c.id==best)
+        residues=[r for r in chain if r.resname.strip() in std]
+        probs=[]
+        for r in residues:
+            names={a.get_name().strip() for a in r.get_atoms()}; missing=sorted(required-names)
+            if missing: probs.append(f'{best}{r.id[1]}:{r.resname.strip()}:missing={",".join(missing)}')
+        if probs:
+            qc=';'.join(probs)
+            print(f'[WARNING] {inp}: incomplete backbone coordinates ({qc}); attempting MPNN design anyway',file=sys.stderr)
+            with open(root/'summary'/'input_qc.tsv','a') as q:
+                q.write(f'{inp}\tbackbone_warning\t{qc}\n')
+        # Freeze one standardized chain-A, consecutively numbered reference and WT sequence.
+        chain.id='A'
+        for j,r in enumerate(residues,1): r.id=(' ',10000+j,' ')
+        for j,r in enumerate(residues,1): r.id=(' ',j,' ')
+        for c in list(model):
+            if c is not chain: model.detach_child(c.id)
+        for r in list(chain):
+            if r.resname.strip() not in aa: chain.detach_child(r.id)
+        name=f'{n}_{stem}'; od=prepared/name; od.mkdir(parents=True,exist_ok=True)
+        ref=od/'ref_clean.pdb'; io=PDBIO(); io.set_structure(s); io.save(str(ref))
+        seq=''.join(aa[r.resname.strip()] for r in residues); (od/'wt.fasta').write_text('>WT\n'+seq+'\n')
+        plist.write(str(ref)+'\n'); plist.flush(); manifest.write(f'{inp}\t{ref}\t{name}\n'); manifest.flush()
+        print(f'[prepared] {inp} -> {name}; residues={len(residues)}')
+    except Exception as e: log(inp,'','preparation_failed',str(e).replace('\t',' ').replace('\n',' '))
+fail.close(); plist.close(); manifest.close()
+PYPREP
+
+[[ -s "$PREPARED_LIST" ]] || { fail "No valid structures remained after preparation."; exit 3; }
+prepared_count=$(wc -l < "$PREPARED_LIST")
+info "Prepared $prepared_count structure(s). All replicates will use these exact frozen references."
 
 for ((r=1;r<=RUNS;r++)); do
  printf -v run_name 'run_%03d' "$r"
  seed=$((BASE_SEED+r-1))
  run_out="$OUT_BASE/replicates/$run_name"
  echo "=== $run_name/$RUNS | seed=$seed | T=$TEMP ==="
- cmd=("$ENGINE" "${INPUT_ARGS[@]}" --num-seqs "$NUM_SEQS" --temp "$TEMP" --models "$MODELS" --out "$run_out" --ligandmpnn "$LIGANDMPNN_PATH" --analysis-python "$ANALYSIS_PYTHON_BIN" --mpnn-python "$MPNN_PYTHON_BIN" --seed "$seed")
+ cmd=("$ENGINE" --prepared-list "$PREPARED_LIST" --num-seqs "$NUM_SEQS" --temp "$TEMP" --models "$MODELS" --out "$run_out" --ligandmpnn "$LIGANDMPNN_PATH" --analysis-python "$ANALYSIS_PYTHON_BIN" --mpnn-python "$MPNN_PYTHON_BIN" --seed "$seed")
   "${cmd[@]}"
  printf '%s\t%d\t%s\t%s\t%s\t%s\n' "$run_name" "$seed" "$TEMP" "$NUM_SEQS" "$MODELS" "$run_out" >> "$OUT_BASE/summary/run_metadata.tsv"
 done
@@ -732,6 +846,7 @@ echo
 printf "%b%b✓ BENCHMARK COMPLETE%b\n\n" "$GREEN" "$BOLD" "$RESET"
 printf "%bResults%b\n" "$BOLD" "$RESET"
 printf "  %-24s %b%s%b\n" "Benchmark root:" "$CYAN" "$OUT_BASE" "$RESET"
+printf "  %-24s %b%s%b\n" "Prepared references:" "$CYAN" "$OUT_BASE/prepared_inputs/" "$RESET"
 printf "  %-24s %b%s%b\n" "Replicate runs:" "$CYAN" "$OUT_BASE/replicates/run_XXX/" "$RESET"
 printf "  %-24s %b%s%b\n" "Mutation maps:" "$CYAN" "$OUT_BASE/replicates/run_XXX/profiles/<protein>/<model>/" "$RESET"
 printf "  %-24s %b%s%b\n" "Run metadata:" "$CYAN" "$OUT_BASE/summary/run_metadata.tsv" "$RESET"
